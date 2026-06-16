@@ -212,8 +212,16 @@ function log(msg: string) {
   console.log(`[relay] ${msg}`);
 }
 
+// Optional TLS (dev): RELAY_TLS_CERT/RELAY_TLS_KEY point at PEM files. Used by
+// test-tls.ts to give the daemon a wss:// target (self-signed; daemon connects
+// with --relay-insecure).
+const tlsOpt = Bun.env.RELAY_TLS_CERT && Bun.env.RELAY_TLS_KEY
+  ? { tls: { cert: Bun.file(Bun.env.RELAY_TLS_CERT), key: Bun.file(Bun.env.RELAY_TLS_KEY) } }
+  : {};
+
 const server = Bun.serve<SockData, {}>({
   port: PORT,
+  ...tlsOpt,
   fetch(req, server) {
     const url = new URL(req.url);
     if (url.pathname === "/healthz") return Response.json({ ok: true, protocol_version: PROTOCOL_VERSION, daemons: daemons.size, clients: clients.size });

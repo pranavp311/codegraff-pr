@@ -3786,6 +3786,7 @@ pub fn main(init: std.process.Init) !void {
     var port_flag: u16 = 8787; // harness serve
     var token_flag: ?[]const u8 = null; // harness serve
     var relay_flag: ?[]const u8 = null; // harness serve --relay <ws-url>
+    var relay_insecure_flag = false; // harness serve --relay-insecure (dev)
     var positionals: std.ArrayList([]const u8) = .empty;
     {
         var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
@@ -3838,6 +3839,8 @@ pub fn main(init: std.process.Init) !void {
                 } else if (std.mem.eql(u8, arg, "--relay")) {
                     const rv = it.next() orelse std.process.fatal("--relay needs a ws:// or wss:// URL — harness --help", .{});
                     relay_flag = try arena.dupe(u8, rv);
+                } else if (std.mem.eql(u8, arg, "--relay-insecure")) {
+                    relay_insecure_flag = true;
                 } else {
                     std.process.fatal("unknown flag '{s}' — harness --help lists them", .{arg});
                 }
@@ -3905,6 +3908,7 @@ pub fn main(init: std.process.Init) !void {
             .append_system_prompt = append_system_flag,
             .relay_url = relay_flag,
             .device_label = init.environ_map.get("GRAFF_RELAY_DEVICE_LABEL") orelse host_flag,
+            .relay_insecure = relay_insecure_flag,
         }, exe);
         return;
     }
@@ -6416,6 +6420,8 @@ const ServeConfig = struct {
     relay_url: ?[]const u8 = null,
     /// Label shown in the relay's session picker.
     device_label: []const u8 = "graff",
+    /// Dev only: skip TLS cert/host verification (self-signed relay).
+    relay_insecure: bool = false,
 };
 
 /// Cap on one child event line (a tool_result event carrying a big tool
@@ -6974,7 +6980,7 @@ fn serveRelayMain(gpa: Allocator, io: Io, cfg: ServeConfig, exe: []const u8, url
 }
 
 fn relayConnectOnce(gpa: Allocator, io: Io, st: *ServeState, cfg: ServeConfig, url: []const u8, account_token: []const u8) !void {
-    var client = try relayws.WsClient.connect(gpa, io, url);
+    var client = try relayws.WsClient.connect(gpa, io, url, cfg.relay_insecure);
     defer client.deinit(gpa); // runs AFTER conn_group.cancel below (LIFO) — handlers stop first
     var conn_group: Io.Group = .init;
     defer conn_group.cancel(io); // cancel + join in-flight handlers before the socket closes

@@ -11,7 +11,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     const url = "ws://127.0.0.1:8788/v1/relay/daemon";
-    var ws = relay.WsClient.connect(gpa, io, url) catch |err| {
+    var ws = relay.WsClient.connect(gpa, io, url, false) catch |err| {
         std.debug.print("connect failed: {t} (is relay-dev running on :8788?)\n", .{err});
         return err;
     };

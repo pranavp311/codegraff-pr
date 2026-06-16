@@ -11,10 +11,7 @@ import {
 import { BrandMark } from "./BrandMark";
 import { openExternalUrl } from "../services/desktop/client";
 import { useExpandedProjectPaths } from "../hooks/useExpandedProjectPaths";
-import {
-  useSessionActions,
-  useSidebarSession,
-} from "../hooks/useSession";
+import { useSessionActions, useSidebarSession } from "../hooks/useSession";
 import { formatRelativeTimestamp } from "../utils/time";
 import { handleWindowDragStart } from "../utils/window";
 import { ProjectSidebarActions } from "./ProjectSidebarActions";
@@ -37,6 +34,22 @@ import {
 } from "./ui/Sidebar";
 
 const CODEGRAFF_GITHUB_URL = "https://github.com/justrach/codegraff";
+
+function existingConversationId(
+  workspace: { conversations: { conversationId: string }[] },
+  preferredConversationId: string | null | undefined,
+) {
+  if (
+    preferredConversationId != null &&
+    workspace.conversations.some(
+      (conversation) => conversation.conversationId === preferredConversationId,
+    )
+  ) {
+    return preferredConversationId;
+  }
+
+  return workspace.conversations[0]?.conversationId ?? null;
+}
 
 function SidebarWatermark() {
   function handleOpenGithub() {
@@ -308,10 +321,10 @@ export function ProjectSidebar({
                 {visibleManagedChats.map((chatWorkspace) => {
                   const isChatOpen =
                     chatWorkspace.workspacePath === activeWorkspacePath;
-                  const activeChatId =
-                    chatWorkspace.selectedConversationId ??
-                    chatWorkspace.conversations[0]?.conversationId ??
-                    null;
+                  const activeChatId = existingConversationId(
+                    chatWorkspace,
+                    chatWorkspace.selectedConversationId,
+                  );
                   const isActive =
                     isChatOpen && activeConversationId === activeChatId;
                   const chatTitle =
@@ -398,7 +411,10 @@ export function ProjectSidebar({
                     isProjectOpen && activeConversationId == null;
                   const isExpanded = isProjectExpanded(project.workspacePath);
                   const selectedConversationId = isProjectOpen
-                    ? (activeConversationId ?? project.selectedConversationId)
+                    ? existingConversationId(
+                        project,
+                        activeConversationId ?? project.selectedConversationId,
+                      )
                     : null;
 
                   return (
@@ -421,7 +437,6 @@ export function ProjectSidebar({
             )}
           </SidebarGroupContent>
         </SidebarGroup>
-
       </SidebarContent>
 
       <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 px-3 pb-3">

@@ -4,14 +4,15 @@
 //! fragmentation reassembly. One message in / one message out at a time
 //! (the daemon serializes per session anyway).
 //!
-//! ws:// only for now (tested against the relay-dev reference relay). wss://
-//! (TLS via std.crypto.tls.Client layered over the stream) is a follow-up —
-//! see connect(); the production relay is WSS.
+//! Supports ws:// (plain TCP) and wss:// (TLS via std.crypto.tls.Client layered
+//! over the stream). `insecure` disables cert/host verification for connecting
+//! to a self-signed dev relay; production wss:// uses the system CA bundle.
 
 const std = @import("std");
 const Io = std.Io;
 const net = std.Io.net;
 const Allocator = std.mem.Allocator;
+const tls = std.crypto.tls;
 
 pub const Opcode = enum(u4) {
     cont = 0x0,
@@ -25,41 +26,79 @@ pub const Opcode = enum(u4) {
 
 pub const Error = error{
     BadUrl,
-    TlsNotSupportedYet,
     HandshakeFailed,
     PeerClosed,
     MessageTooLong,
     StreamTooLong,
 } || Allocator.Error || Io.Reader.Error || Io.Writer.Error;
 
-const rbuf_cap = 64 * 1024;
-const wbuf_cap = 64 * 1024;
+// Encrypted/raw socket buffers (TLS asserts these are >= tls min_buffer_len).
+const sock_buf_cap = 64 * 1024;
+// Plaintext TLS buffers.
+const tls_buf_cap = 64 * 1024;
 /// Hard cap on one reassembled inbound message (matches the daemon's
 /// serve_line_cap intent: a tool_result event is the realistic worst case).
 const message_cap = 1024 * 1024;
+
+comptime {
+    if (sock_buf_cap < tls.max_ciphertext_record_len) @compileError("sock_buf_cap < tls min_buffer_len");
+}
 
 pub const WsClient = struct {
     io: Io,
     stream: net.Stream,
     rd: net.Stream.Reader,
     wr: net.Stream.Writer,
-    rbuf: [rbuf_cap]u8 = undefined,
-    wbuf: [wbuf_cap]u8 = undefined,
+    // Active plaintext interfaces: raw stream for ws://, TLS plaintext for wss://.
+    r: *Io.Reader = undefined,
+    w: *Io.Writer = undefined,
+    tls_client: ?tls.Client = null,
+    ca_bundle: std.crypto.Certificate.Bundle = .empty,
+    ca_lock: Io.RwLock = .init,
+    gpa: Allocator,
+    sock_rbuf: [sock_buf_cap]u8 = undefined,
+    sock_wbuf: [sock_buf_cap]u8 = undefined,
+    tls_rbuf: [tls_buf_cap]u8 = undefined,
+    tls_wbuf: [tls_buf_cap]u8 = undefined,
 
-    /// Connect + perform the HTTP Upgrade handshake. Heap-allocated and stable
-    /// (the Reader/Writer interfaces reference its inline buffers).
-    pub fn connect(gpa: Allocator, io: Io, url: []const u8) Error!*WsClient {
+    /// Connect + (for wss) TLS handshake + the HTTP Upgrade handshake.
+    /// Heap-allocated and stable (the Reader/Writer interfaces and the TLS
+    /// client reference its inline buffers and each other).
+    pub fn connect(gpa: Allocator, io: Io, url: []const u8, insecure: bool) Error!*WsClient {
         const u = parseUrl(url) orelse return error.BadUrl;
-        if (u.tls) return error.TlsNotSupportedYet; // wss: layer std.crypto.tls.Client here (follow-up)
 
         const addr = net.IpAddress.resolve(io, u.host, u.port) catch return error.HandshakeFailed;
         const stream = net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.HandshakeFailed;
 
         const self = try gpa.create(WsClient);
         errdefer gpa.destroy(self);
-        self.* = .{ .io = io, .stream = stream, .rd = undefined, .wr = undefined };
-        self.rd = net.Stream.Reader.init(stream, io, &self.rbuf);
-        self.wr = net.Stream.Writer.init(stream, io, &self.wbuf);
+        self.* = .{ .io = io, .stream = stream, .rd = undefined, .wr = undefined, .gpa = gpa };
+        self.rd = net.Stream.Reader.init(stream, io, &self.sock_rbuf);
+        self.wr = net.Stream.Writer.init(stream, io, &self.sock_wbuf);
+
+        if (u.tls) {
+            var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
+            io.random(&entropy);
+            if (!insecure) self.ca_bundle.rescan(gpa, io, Io.Clock.real.now(io)) catch return error.HandshakeFailed;
+            self.tls_client = tls.Client.init(&self.rd.interface, &self.wr.interface, .{
+                .host = if (insecure) .no_verification else .{ .explicit = u.host },
+                .ca = if (insecure) .no_verification else .{ .bundle = .{
+                    .gpa = gpa,
+                    .io = io,
+                    .lock = &self.ca_lock,
+                    .bundle = &self.ca_bundle,
+                } },
+                .write_buffer = &self.tls_wbuf,
+                .read_buffer = &self.tls_rbuf,
+                .entropy = &entropy,
+                .realtime_now = Io.Clock.real.now(io),
+            }) catch return error.HandshakeFailed;
+            self.r = &self.tls_client.?.reader;
+            self.w = &self.tls_client.?.writer;
+        } else {
+            self.r = &self.rd.interface;
+            self.w = &self.wr.interface;
+        }
 
         try self.handshake(u);
         return self;
@@ -67,6 +106,7 @@ pub const WsClient = struct {
 
     pub fn deinit(self: *WsClient, gpa: Allocator) void {
         self.sendFrame(.close, "") catch {};
+        self.ca_bundle.deinit(gpa);
         self.stream.close(self.io);
         gpa.destroy(self);
     }
@@ -77,13 +117,12 @@ pub const WsClient = struct {
     }
 
     /// Read one complete (re-assembled) message into `out`. Control frames
-    /// (ping/pong/close) are handled internally and never surface here; on a
-    /// peer close this returns error.PeerClosed. Returns the message opcode
-    /// (.text or .binary).
+    /// (ping/pong/close) are handled internally; a peer close → error.PeerClosed.
+    /// Returns the message opcode (.text or .binary).
     pub fn readMessage(self: *WsClient, gpa: Allocator, out: *std.ArrayList(u8)) Error!Opcode {
         out.clearRetainingCapacity();
         var msg_op: ?Opcode = null;
-        const r = &self.rd.interface;
+        const r = self.r;
         while (true) {
             const h = try r.takeArray(2);
             const fin = (h[0] & 0x80) != 0;
@@ -136,23 +175,26 @@ pub const WsClient = struct {
         var key_b64: [24]u8 = undefined;
         _ = std.base64.standard.Encoder.encode(&key_b64, &key_raw);
 
-        const w = &self.wr.interface;
-        try w.print(
+        try self.w.print(
             "GET {s} HTTP/1.1\r\nHost: {s}:{d}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
                 "Sec-WebSocket-Key: {s}\r\nSec-WebSocket-Version: 13\r\n\r\n",
             .{ u.path, u.host, u.port, &key_b64 },
         );
-        try w.flush();
+        try self.flushTransport();
 
-        const r = &self.rd.interface;
         // status line: expect "HTTP/1.1 101 ..."
-        const status = (try r.takeDelimiterInclusive('\n'));
+        const status = try self.r.takeDelimiterInclusive('\n');
         if (std.mem.indexOf(u8, status, " 101 ") == null) return error.HandshakeFailed;
         // drain headers until the blank line
         while (true) {
-            const line = try r.takeDelimiterInclusive('\n');
+            const line = try self.r.takeDelimiterInclusive('\n');
             if (line.len <= 2) break; // "\r\n" or "\n"
         }
+    }
+
+    fn flushTransport(self: *WsClient) Error!void {
+        try self.w.flush(); // for TLS this encrypts plaintext into the socket writer…
+        if (self.tls_client != null) try self.wr.interface.flush(); // …then push the socket buffer
     }
 
     fn sendFrame(self: *WsClient, op: Opcode, payload: []const u8) Error!void {
@@ -175,17 +217,16 @@ pub const WsClient = struct {
         @memcpy(hdr[n .. n + 4], &mask);
         n += 4;
 
-        const w = &self.wr.interface;
-        try w.writeAll(hdr[0..n]);
+        try self.w.writeAll(hdr[0..n]);
         var i: usize = 0;
         var tmp: [4096]u8 = undefined;
         while (i < payload.len) {
             const chunk = @min(tmp.len, payload.len - i);
             for (0..chunk) |j| tmp[j] = payload[i + j] ^ mask[(i + j) & 3];
-            try w.writeAll(tmp[0..chunk]);
+            try self.w.writeAll(tmp[0..chunk]);
             i += chunk;
         }
-        try w.flush();
+        try self.flushTransport();
     }
 };
 
@@ -197,9 +238,9 @@ const Url = struct { tls: bool, host: []const u8, port: u16, path: []const u8 };
 
 fn parseUrl(url: []const u8) ?Url {
     var rest = url;
-    var tls = false;
+    var is_tls = false;
     if (std.mem.startsWith(u8, rest, "wss://")) {
-        tls = true;
+        is_tls = true;
         rest = rest["wss://".len..];
     } else if (std.mem.startsWith(u8, rest, "ws://")) {
         rest = rest["ws://".len..];
@@ -211,10 +252,10 @@ fn parseUrl(url: []const u8) ?Url {
     if (authority.len == 0) return null;
 
     var host = authority;
-    var port: u16 = if (tls) 443 else 80;
+    var port: u16 = if (is_tls) 443 else 80;
     if (std.mem.lastIndexOfScalar(u8, authority, ':')) |c| {
         host = authority[0..c];
         port = std.fmt.parseInt(u16, authority[c + 1 ..], 10) catch return null;
     }
-    return .{ .tls = tls, .host = host, .port = port, .path = path };
+    return .{ .tls = is_tls, .host = host, .port = port, .path = path };
 }
