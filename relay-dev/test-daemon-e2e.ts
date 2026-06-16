@@ -70,6 +70,15 @@ try {
   const pres = await cli.until((f) => f.t === "presence" && (f.daemons ?? []).some((d: any) => (d.sessions ?? []).some((s: any) => s.session_id === sid)));
   check(!!pres, "new session shows in presence");
 
+  // a control `message` streams its ack back over the relay (offline-safe: no
+  // LLM call). Proves the message->event->end channel path end to end.
+  cli.send({ t: "open", channel_id: "c3", daemon_id: dId, op: "message", session_id: sid, body: { type: "set_model", name: "deepseek-v4-pro" } });
+  const ack = await cli.until((f) => f.t === "event" && f.channel_id === "c3");
+  check(ack.data?.type === "model", `set_model streamed a model ack (ok=${ack.data?.ok})`);
+  check(typeof ack.seq === "number", "event carries a seq");
+  const end3 = await cli.until((f) => f.t === "end" && f.channel_id === "c3");
+  check(end3.status === "complete", "message channel ends complete");
+
   // delete it
   cli.send({ t: "open", channel_id: "c2", daemon_id: dId, op: "delete", session_id: sid, body: {} });
   const end2 = await cli.until((f) => f.t === "end" && f.channel_id === "c2");

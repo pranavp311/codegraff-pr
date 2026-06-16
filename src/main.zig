@@ -6719,7 +6719,7 @@ fn serveMessage(st: *ServeState, req: *std.http.Server.Request, id: []const u8) 
         return respondJson(st, req, .bad_request, "{\"error\":\"body must be a single-line JSON object\"}");
 
     const rtype = if (parsed.object.get("type")) |v| (if (v == .string) v.string else "") else "";
-    if (std.mem.eql(u8, rtype, "answer")) return serveAnswer(st, req, s, line, parsed.object);
+    if (std.mem.eql(u8, rtype, "answer")) return serveAnswer(st, req, s, line);
 
     s.busy.lockUncancelable(io); // serialize requests per session
     defer s.busy.unlock(io);
@@ -6772,28 +6772,37 @@ fn serveMessage(st: *ServeState, req: *std.http.Server.Request, id: []const u8) 
     bw.end() catch return;
 }
 
-fn serveAnswer(st: *ServeState, req: *std.http.Server.Request, s: *ServeSession, line: []const u8, obj: std.json.ObjectMap) !void {
+const AnswerResult = enum { ok, no_active, mismatch, gone };
+
+/// Transport-free: validate an `answer` against the session's pending ask_user
+/// and write it to the child's stdin. Shared by the HTTP and relay answer paths.
+fn serveApplyAnswer(st: *ServeState, s: *ServeSession, line: []const u8) AnswerResult {
     const io = st.io;
     s.answer_mu.lockUncancelable(io);
     defer s.answer_mu.unlock(io);
 
-    if (!s.awaiting_answer) {
-        return respondJson(st, req, .conflict, "{\"error\":\"no active ask_user prompt\"}");
-    }
-    const req_call_id = if (obj.get("call_id")) |v| (if (v == .string) v.string else "") else "";
+    if (!s.awaiting_answer) return .no_active;
+    const req_call_id = serveStringField(line, "call_id") orelse "";
     const active_call_id = s.answer_call_id[0..s.answer_call_id_len];
-    if (req_call_id.len > 0 and active_call_id.len > 0 and !std.mem.eql(u8, req_call_id, active_call_id)) {
-        return respondJson(st, req, .conflict, "{\"error\":\"answer call_id does not match active ask_user prompt\"}");
-    }
+    if (req_call_id.len > 0 and active_call_id.len > 0 and !std.mem.eql(u8, req_call_id, active_call_id)) return .mismatch;
 
     var wb: [1024]u8 = undefined;
     var cw = s.child.stdin.?.writerStreaming(io, &wb);
-    cw.interface.writeAll(line) catch return respondJson(st, req, .bad_gateway, "{\"error\":\"session process is gone\"}");
-    cw.interface.writeByte('\n') catch return error.WriteFailed;
-    cw.interface.flush() catch return respondJson(st, req, .bad_gateway, "{\"error\":\"session process is gone\"}");
+    cw.interface.writeAll(line) catch return .gone;
+    cw.interface.writeByte('\n') catch return .gone;
+    cw.interface.flush() catch return .gone;
     s.awaiting_answer = false;
     s.answer_call_id_len = 0;
-    return respondJson(st, req, .ok, "{\"ok\":true,\"type\":\"answer\"}");
+    return .ok;
+}
+
+fn serveAnswer(st: *ServeState, req: *std.http.Server.Request, s: *ServeSession, line: []const u8) !void {
+    return switch (serveApplyAnswer(st, s, line)) {
+        .ok => respondJson(st, req, .ok, "{\"ok\":true,\"type\":\"answer\"}"),
+        .no_active => respondJson(st, req, .conflict, "{\"error\":\"no active ask_user prompt\"}"),
+        .mismatch => respondJson(st, req, .conflict, "{\"error\":\"answer call_id does not match active ask_user prompt\"}"),
+        .gone => respondJson(st, req, .bad_gateway, "{\"error\":\"session process is gone\"}"),
+    };
 }
 
 fn serveUpdateAnswerState(io: Io, s: *ServeSession, line: []const u8) void {
@@ -6921,18 +6930,23 @@ fn serveDelete(st: *ServeState, req: *std.http.Server.Request, id: []const u8) !
 // same session machinery (serveSpawn + the child stdin/stdout pumps); only the
 // transport differs — relay frames vs HTTP.
 //
-// v1 limitation: opens are handled sequentially, so a streaming `message`
-// blocks the read loop for that turn — an `answer` can't be delivered mid-turn
-// yet (ask_user turns from mobile need the concurrent worker, the next step).
-// create / delete / non-ask_user turns work today.
+// Each inbound frame is handled on a worker (relayDispatchOwned) so the read
+// loop stays free: a streaming turn on one channel runs concurrently with an
+// `answer` or a new open on another (ask_user from mobile works). Per-session
+// serialization is still enforced by the existing `busy` mutex; `answer` is an
+// ack-only side channel that bypasses `busy` (matches serveAnswer). TLS (wss://)
+// is the remaining follow-up; ws:// works against relay-dev.
 
 const RelayConn = struct {
     st: *ServeState,
     client: *relayws.WsClient,
     gpa: Allocator,
     io: Io,
+    write_mu: Io.Mutex = .init, // one writer at a time — handlers run concurrently
 
     fn send(self: *RelayConn, json: []const u8) void {
+        self.write_mu.lockUncancelable(self.io);
+        defer self.write_mu.unlock(self.io);
         self.client.sendText(json) catch {};
     }
 };
@@ -6961,7 +6975,9 @@ fn serveRelayMain(gpa: Allocator, io: Io, cfg: ServeConfig, exe: []const u8, url
 
 fn relayConnectOnce(gpa: Allocator, io: Io, st: *ServeState, cfg: ServeConfig, url: []const u8, account_token: []const u8) !void {
     var client = try relayws.WsClient.connect(gpa, io, url);
-    defer client.deinit(gpa);
+    defer client.deinit(gpa); // runs AFTER conn_group.cancel below (LIFO) — handlers stop first
+    var conn_group: Io.Group = .init;
+    defer conn_group.cancel(io); // cancel + join in-flight handlers before the socket closes
     var rc = RelayConn{ .st = st, .client = client, .gpa = gpa, .io = io };
 
     var hello_arena = std.heap.ArenaAllocator.init(gpa);
@@ -6977,10 +6993,20 @@ fn relayConnectOnce(gpa: Allocator, io: Io, st: *ServeState, cfg: ServeConfig, u
     serveLog(io, "relay: {s}", .{msg.items});
     relaySendSessions(&rc);
 
+    // Read loop stays free; each frame is handled on a worker so a streaming
+    // turn doesn't block delivery of `answer`/new opens (concurrent channels).
     while (true) {
         _ = try client.readMessage(gpa, &msg);
-        relayDispatch(&rc, msg.items);
+        const owned = gpa.dupe(u8, msg.items) catch continue;
+        conn_group.concurrent(io, relayDispatchOwned, .{ &rc, owned }) catch relayDispatchOwned(&rc, owned);
     }
+}
+
+/// Worker entry: owns `frame` (frees it) for the whole handler lifetime,
+/// including a long-running streaming turn.
+fn relayDispatchOwned(rc: *RelayConn, frame: []u8) void {
+    defer rc.gpa.free(frame);
+    relayDispatch(rc, frame);
 }
 
 /// Send the daemon's current session list (feeds the relay's presence).
@@ -7110,18 +7136,16 @@ fn relayDropById(rc: *RelayConn, id: []const u8) void {
 fn relayStreamMessage(rc: *RelayConn, sess: *ServeSession, session_id: []const u8, channel_id: []const u8, client_id: []const u8, line: []const u8) void {
     const io = rc.io;
 
-    // `answer` is an ack-only side channel: write it through and ack — the
-    // in-flight user stream (another channel) surfaces the resulting events.
+    // `answer` is an ack-only side channel: validate + write it through and
+    // ack — the in-flight user stream (another channel) surfaces the result.
     const is_answer = serveStringField(line, "type") != null and
         std.mem.eql(u8, serveStringField(line, "type").?, "answer");
     if (is_answer) {
-        var wb: [1024]u8 = undefined;
-        var cw = sess.child.stdin.?.writerStreaming(io, &wb);
-        cw.interface.writeAll(line) catch return relayEnd(rc, channel_id, client_id, "error", "internal");
-        cw.interface.writeByte('\n') catch {};
-        cw.interface.flush() catch {};
-        serveClearAnswerState(io, sess);
-        return relayEnd(rc, channel_id, client_id, "complete", null);
+        return switch (serveApplyAnswer(rc.st, sess, line)) {
+            .ok => relayEnd(rc, channel_id, client_id, "complete", null),
+            .no_active, .mismatch => relayEnd(rc, channel_id, client_id, "error", "protocol_error"),
+            .gone => relayEnd(rc, channel_id, client_id, "error", "transport_reset"),
+        };
     }
 
     sess.busy.lockUncancelable(io);
