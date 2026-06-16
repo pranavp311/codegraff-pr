@@ -35,6 +35,7 @@ const Io = std.Io;
 const Value = std.json.Value;
 const Allocator = std.mem.Allocator;
 const mcp = @import("mcp.zig");
+const relayws = @import("relay.zig");
 
 const builtin = @import("builtin");
 
@@ -114,6 +115,25 @@ const schema_serve_json =
     \\    {"method": "POST", "path": "/v1/sessions", "description": "create a session (a graff --json child); optional JSON body {\"model\",\"yolo\",\"system_prompt\",\"append_system_prompt\"} overrides serve-level defaults; responds {\"session_id\":\"<16 hex>\"}"},
     \\    {"method": "POST", "path": "/v1/sessions/{id}", "description": "body is ONE stdio-protocol request object (user / set_system_prompt / set_model / compact / set_mode / set_agent / score / answer); non-answer requests stream application/x-ndjson events until the request's terminal event (turn/error, or the request-specific ack); answer requests return JSON ack while the original user stream continues; one non-answer request in flight per session at a time"},
     \\    {"method": "DELETE", "path": "/v1/sessions/{id}", "description": "graceful close: waits for any in-flight request, then EOFs the child's stdin"}
+    \\  ]
+    \\}
+;
+
+/// Documentation of the `graff serve --relay` mode, embedded verbatim in
+/// `--schema`. The daemon dials OUT to a cloud relay (no inbound ports) for the
+/// mobile feature; the relay routes a phone to the daemon within one account.
+/// The full wire contract is relay-dev/PROTOCOL.md (protocol_version 1).
+const schema_relay_json =
+    \\{
+    \\  "transport": "WebSocket to a relay (graff serve --relay <ws://|wss://url>); the daemon dials out, no inbound ports. Auth: --token doubles as the relay account token. Full contract: relay-dev/PROTOCOL.md (protocol_version 1).",
+    \\  "frames": [
+    \\    {"t": "hello", "dir": "daemon->relay", "description": "{role:'daemon', protocol_version, account_token, device_label, agent_version, schema_version, capabilities[]} -> relay replies 'welcome'"},
+    \\    {"t": "sessions", "dir": "daemon->relay", "description": "{list:[{session_id,title,busy}]} snapshot; sent after welcome and on any session change (feeds the relay's presence)"},
+    \\    {"t": "open", "dir": "relay->daemon", "description": "{channel_id, client_id, op:'create'|'message'|'delete', session_id?, body} — create/message/delete map onto the serve session handlers"},
+    \\    {"t": "event", "dir": "daemon->relay", "description": "{channel_id, client_id, seq, data:<one graff --json event>} streamed per channel"},
+    \\    {"t": "end", "dir": "daemon->relay", "description": "{channel_id, client_id, status:'complete'|'error', code?} terminates a channel"},
+    \\    {"t": "notify", "dir": "daemon->relay", "description": "{session_id, kind:'turn_done'|'needs_input'} content-free push trigger"},
+    \\    {"t": "ping|pong", "dir": "both", "description": "heartbeat"}
     \\  ]
     \\}
 ;
@@ -792,6 +812,8 @@ fn emitSchema(w: *Io.Writer) !void {
     try s.print("{s}", .{schema_protocol_json});
     try s.objectField("serve");
     try s.print("{s}", .{schema_serve_json});
+    try s.objectField("relay");
+    try s.print("{s}", .{schema_relay_json});
     try s.endObject();
     try w.writeByte('\n');
     try w.flush();
@@ -3517,6 +3539,8 @@ const usage_text =
     \\  graff serve                      HTTP/NDJSON bridge over the --json protocol
     \\                                   (--host/--port/--token; sessions are --json children)
     \\  graff update [--force|--check]   update graff to the latest GitHub release
+    \\  graff serve --relay <ws-url>     dial OUT to a cloud relay (mobile feature; no inbound
+    \\                                   ports); --token is the relay account token
     \\
     \\flags:
     \\  --model <name>   start on this model (same fuzzy resolution as /model)
@@ -3761,6 +3785,7 @@ pub fn main(init: std.process.Init) !void {
     var host_flag: []const u8 = "127.0.0.1"; // harness serve
     var port_flag: u16 = 8787; // harness serve
     var token_flag: ?[]const u8 = null; // harness serve
+    var relay_flag: ?[]const u8 = null; // harness serve --relay <ws-url>
     var positionals: std.ArrayList([]const u8) = .empty;
     {
         var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
@@ -3810,6 +3835,9 @@ pub fn main(init: std.process.Init) !void {
                 } else if (std.mem.eql(u8, arg, "--token")) {
                     const tv = it.next() orelse std.process.fatal("--token needs a value — harness --help", .{});
                     token_flag = try arena.dupe(u8, tv);
+                } else if (std.mem.eql(u8, arg, "--relay")) {
+                    const rv = it.next() orelse std.process.fatal("--relay needs a ws:// or wss:// URL — harness --help", .{});
+                    relay_flag = try arena.dupe(u8, rv);
                 } else {
                     std.process.fatal("unknown flag '{s}' — harness --help lists them", .{arg});
                 }
@@ -3875,6 +3903,8 @@ pub fn main(init: std.process.Init) !void {
             .model = model_flag,
             .system_prompt = system_prompt_flag,
             .append_system_prompt = append_system_flag,
+            .relay_url = relay_flag,
+            .device_label = init.environ_map.get("GRAFF_RELAY_DEVICE_LABEL") orelse host_flag,
         }, exe);
         return;
     }
@@ -6380,6 +6410,12 @@ const ServeConfig = struct {
     model: ?[]const u8,
     system_prompt: ?[]const u8,
     append_system_prompt: ?[]const u8,
+    /// When set, the daemon dials OUT to this relay (ws://|wss://) instead of
+    /// binding an inbound HTTP port. `token` doubles as the relay account token
+    /// (dev relay format "<account_id>:<device_id>").
+    relay_url: ?[]const u8 = null,
+    /// Label shown in the relay's session picker.
+    device_label: []const u8 = "graff",
 };
 
 /// Cap on one child event line (a tool_result event carrying a big tool
@@ -6431,6 +6467,7 @@ fn serveLog(io: Io, comptime fmt: []const u8, args: anytype) void {
 }
 
 fn serveMain(gpa: Allocator, io: Io, cfg: ServeConfig, exe: []const u8) !void {
+    if (cfg.relay_url) |url| return serveRelayMain(gpa, io, cfg, exe, url);
     const loopback = std.mem.eql(u8, cfg.host, "127.0.0.1") or std.mem.eql(u8, cfg.host, "::1");
     if (!loopback and cfg.token == null)
         std.process.fatal("serve: refusing to bind {s} without auth — pass --token <secret> or set HARNESS_SERVE_TOKEN", .{cfg.host});
@@ -6559,10 +6596,64 @@ fn serveRequest(st: *ServeState, req: *std.http.Server.Request) !void {
     return respondJson(st, req, .not_found, "{\"error\":\"not found — see /v1/schema\"}");
 }
 
+/// Transport-free session spawn: build argv, spawn a `harness --json` child,
+/// register the session. Shared by the HTTP create handler and the relay path.
+/// Returns null on any failure (caller maps to its own transport's error).
+fn serveSpawn(st: *ServeState, model: ?[]const u8, yolo: bool, sys: ?[]const u8, append_sys: ?[]const u8) ?*ServeSession {
+    const io = st.io;
+    const gpa = st.gpa;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    argv.appendSlice(arena, &.{ st.exe, "--json" }) catch return null;
+    if (yolo) argv.append(arena, "--yolo") catch return null;
+    if (model) |m| argv.appendSlice(arena, &.{ "--model", m }) catch return null;
+    if (sys) |s| argv.appendSlice(arena, &.{ "--system-prompt", s }) catch return null;
+    if (append_sys) |s| argv.appendSlice(arena, &.{ "--append-system-prompt", s }) catch return null;
+
+    var child = std.process.spawn(io, .{
+        .argv = argv.items,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .inherit,
+    }) catch return null;
+
+    const rbuf = gpa.alloc(u8, serve_line_cap) catch {
+        child.kill(io);
+        return null;
+    };
+    const sess = gpa.create(ServeSession) catch {
+        gpa.free(rbuf);
+        child.kill(io);
+        return null;
+    };
+    var raw: [8]u8 = undefined;
+    io.random(&raw);
+    sess.* = .{ .id = undefined, .child = child, .rdr = undefined, .rbuf = rbuf };
+    _ = std.fmt.bufPrint(&sess.id, "{x:0>16}", .{std.mem.readInt(u64, &raw, .big)}) catch unreachable;
+    sess.rdr = sess.child.stdout.?.readerStreaming(io, sess.rbuf);
+
+    st.mutex.lockUncancelable(io);
+    const appended = blk: {
+        st.sessions.append(gpa, sess) catch break :blk false;
+        break :blk true;
+    };
+    st.mutex.unlock(io);
+    if (!appended) {
+        sess.child.kill(io);
+        gpa.free(sess.rbuf);
+        gpa.destroy(sess);
+        return null;
+    }
+    serveLog(io, "serve: session {s} created (model={s} yolo={})", .{ &sess.id, model orelse "default", yolo });
+    return sess;
+}
+
 /// POST /v1/sessions: spawn a `harness --json` child. Per-session options in
 /// the (optional) JSON body override the serve-level defaults.
 fn serveCreate(st: *ServeState, req: *std.http.Server.Request) !void {
-    const io = st.io;
     const gpa = st.gpa;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -6595,48 +6686,8 @@ fn serveCreate(st: *ServeState, req: *std.http.Server.Request) !void {
         };
     }
 
-    var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(arena, &.{ st.exe, "--json" });
-    if (yolo) try argv.append(arena, "--yolo");
-    if (model) |m| try argv.appendSlice(arena, &.{ "--model", m });
-    if (sys) |s| try argv.appendSlice(arena, &.{ "--system-prompt", s });
-    if (append_sys) |s| try argv.appendSlice(arena, &.{ "--append-system-prompt", s });
-
-    var child = std.process.spawn(io, .{
-        .argv = argv.items,
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .inherit, // tool progress → the server's terminal
-    }) catch return respondJson(st, req, .internal_server_error, "{\"error\":\"failed to spawn harness child\"}");
-
-    const rbuf = gpa.alloc(u8, serve_line_cap) catch {
-        child.kill(io);
-        return error.WriteFailed;
-    };
-    const sess = gpa.create(ServeSession) catch {
-        gpa.free(rbuf);
-        child.kill(io);
-        return error.WriteFailed;
-    };
-    var raw: [8]u8 = undefined;
-    io.random(&raw);
-    sess.* = .{ .id = undefined, .child = child, .rdr = undefined, .rbuf = rbuf };
-    _ = std.fmt.bufPrint(&sess.id, "{x:0>16}", .{std.mem.readInt(u64, &raw, .big)}) catch unreachable;
-    sess.rdr = sess.child.stdout.?.readerStreaming(io, sess.rbuf);
-
-    st.mutex.lockUncancelable(io);
-    const appended = blk: {
-        st.sessions.append(gpa, sess) catch break :blk false;
-        break :blk true;
-    };
-    st.mutex.unlock(io);
-    if (!appended) {
-        sess.child.kill(io);
-        gpa.free(sess.rbuf);
-        gpa.destroy(sess);
-        return error.WriteFailed;
-    }
-    serveLog(io, "serve: session {s} created (model={s} yolo={})", .{ &sess.id, model orelse "default", yolo });
+    const sess = serveSpawn(st, model, yolo, sys, append_sys) orelse
+        return respondJson(st, req, .internal_server_error, "{\"error\":\"failed to spawn harness child\"}");
     var obuf: [64]u8 = undefined;
     const out = std.fmt.bufPrint(&obuf, "{{\"session_id\":\"{s}\"}}", .{&sess.id}) catch unreachable;
     return respondJson(st, req, .created, out);
@@ -6862,6 +6913,256 @@ fn serveDelete(st: *ServeState, req: *std.http.Server.Request, id: []const u8) !
     st.group.concurrent(io, serveReap, .{ st, sess }) catch serveReap(st, sess);
     serveLog(io, "serve: session {s} closed", .{id});
     return respondJson(st, req, .ok, "{\"ok\":true}");
+}
+
+// ── Relay client mode (`graff serve --relay`) ───────────────────────────────
+// The daemon dials OUT to the relay (relay-dev/PROTOCOL.md) instead of binding
+// an inbound port, so it works behind NAT with no open ports. It reuses the
+// same session machinery (serveSpawn + the child stdin/stdout pumps); only the
+// transport differs — relay frames vs HTTP.
+//
+// v1 limitation: opens are handled sequentially, so a streaming `message`
+// blocks the read loop for that turn — an `answer` can't be delivered mid-turn
+// yet (ask_user turns from mobile need the concurrent worker, the next step).
+// create / delete / non-ask_user turns work today.
+
+const RelayConn = struct {
+    st: *ServeState,
+    client: *relayws.WsClient,
+    gpa: Allocator,
+    io: Io,
+
+    fn send(self: *RelayConn, json: []const u8) void {
+        self.client.sendText(json) catch {};
+    }
+};
+
+fn jstr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = obj.get(key) orelse return null;
+    return if (v == .string) v.string else null;
+}
+
+fn serveRelayMain(gpa: Allocator, io: Io, cfg: ServeConfig, exe: []const u8, url: []const u8) !void {
+    const account_token = cfg.token orelse
+        std.process.fatal("serve --relay needs --token <account token> (dev relay format \"<account>:<device>\")", .{});
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    var st: ServeState = .{ .gpa = gpa, .io = io, .exe = exe, .cfg = cfg, .group = &group };
+    serveLog(io, "graff serve --relay → {s} · device='{s}' · sessions are `{s} --json` children", .{ url, cfg.device_label, exe });
+
+    var backoff_s: i64 = 1;
+    while (true) {
+        relayConnectOnce(gpa, io, &st, cfg, url, account_token) catch |err|
+            serveLog(io, "relay: disconnected ({t}); retrying in {d}s", .{ err, backoff_s });
+        io.sleep(Io.Duration.fromSeconds(backoff_s), .awake) catch {};
+        backoff_s = @min(backoff_s * 2, 30);
+    }
+}
+
+fn relayConnectOnce(gpa: Allocator, io: Io, st: *ServeState, cfg: ServeConfig, url: []const u8, account_token: []const u8) !void {
+    var client = try relayws.WsClient.connect(gpa, io, url);
+    defer client.deinit(gpa);
+    var rc = RelayConn{ .st = st, .client = client, .gpa = gpa, .io = io };
+
+    var hello_arena = std.heap.ArenaAllocator.init(gpa);
+    defer hello_arena.deinit();
+    const hello = try std.fmt.allocPrint(hello_arena.allocator(),
+        "{{\"t\":\"hello\",\"role\":\"daemon\",\"protocol_version\":1,\"account_token\":\"{s}\",\"device_label\":\"{s}\",\"agent_version\":\"{s}\",\"schema_version\":\"{s}\",\"capabilities\":[\"create\",\"message\",\"delete\",\"notify\",\"sessions\"]}}",
+        .{ account_token, cfg.device_label, harness_version, schema_version });
+    try client.sendText(hello);
+
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(gpa);
+    _ = try client.readMessage(gpa, &msg); // welcome
+    serveLog(io, "relay: {s}", .{msg.items});
+    relaySendSessions(&rc);
+
+    while (true) {
+        _ = try client.readMessage(gpa, &msg);
+        relayDispatch(&rc, msg.items);
+    }
+}
+
+/// Send the daemon's current session list (feeds the relay's presence).
+fn relaySendSessions(rc: *RelayConn) void {
+    var arena_state = std.heap.ArenaAllocator.init(rc.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buf: std.ArrayList(u8) = .empty;
+    buf.appendSlice(arena, "{\"t\":\"sessions\",\"list\":[") catch return;
+    rc.st.mutex.lockUncancelable(rc.io);
+    for (rc.st.sessions.items, 0..) |s, i| {
+        const piece = std.fmt.allocPrint(arena, "{s}{{\"session_id\":\"{s}\",\"title\":null,\"busy\":false}}", .{ if (i == 0) "" else ",", &s.id }) catch break;
+        buf.appendSlice(arena, piece) catch break;
+    }
+    rc.st.mutex.unlock(rc.io);
+    buf.appendSlice(arena, "]}") catch return;
+    rc.send(buf.items);
+}
+
+fn relayEnd(rc: *RelayConn, channel_id: []const u8, client_id: []const u8, status: []const u8, code: ?[]const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(rc.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const frame = if (code) |c|
+        std.fmt.allocPrint(arena, "{{\"t\":\"end\",\"channel_id\":\"{s}\",\"client_id\":\"{s}\",\"status\":\"{s}\",\"code\":\"{s}\"}}", .{ channel_id, client_id, status, c }) catch return
+    else
+        std.fmt.allocPrint(arena, "{{\"t\":\"end\",\"channel_id\":\"{s}\",\"client_id\":\"{s}\",\"status\":\"{s}\"}}", .{ channel_id, client_id, status }) catch return;
+    rc.send(frame);
+}
+
+fn relayNotify(rc: *RelayConn, session_id: []const u8, kind: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(rc.gpa);
+    defer arena_state.deinit();
+    const frame = std.fmt.allocPrint(arena_state.allocator(), "{{\"t\":\"notify\",\"session_id\":\"{s}\",\"kind\":\"{s}\"}}", .{ session_id, kind }) catch return;
+    rc.send(frame);
+}
+
+fn relayDispatch(rc: *RelayConn, frame: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(rc.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const v = std.json.parseFromSliceLeaky(Value, arena, frame, .{}) catch return;
+    if (v != .object) return;
+    const t = jstr(v.object, "t") orelse return;
+    if (std.mem.eql(u8, t, "open")) {
+        relayOpen(rc, arena, v.object);
+    } else if (std.mem.eql(u8, t, "ping")) {
+        rc.send("{\"t\":\"pong\"}");
+    }
+    // welcome / pong / unknown frame types ignored (forward-compat)
+}
+
+fn relayOpen(rc: *RelayConn, arena: Allocator, obj: std.json.ObjectMap) void {
+    const channel_id = jstr(obj, "channel_id") orelse return;
+    const client_id = jstr(obj, "client_id") orelse "";
+    const op = jstr(obj, "op") orelse "";
+
+    if (std.mem.eql(u8, op, "create")) {
+        var model = rc.st.cfg.model;
+        var yolo = rc.st.cfg.yolo;
+        var sys = rc.st.cfg.system_prompt;
+        var append_sys = rc.st.cfg.append_system_prompt;
+        if (obj.get("body")) |b| if (b == .object) {
+            if (jstr(b.object, "model")) |m| model = m;
+            if (b.object.get("yolo")) |y| if (y == .bool) {
+                yolo = y.bool;
+            };
+            if (jstr(b.object, "system_prompt")) |s| sys = s;
+            if (jstr(b.object, "append_system_prompt")) |s| append_sys = s;
+        };
+        const sess = serveSpawn(rc.st, model, yolo, sys, append_sys) orelse
+            return relayEnd(rc, channel_id, client_id, "error", "internal");
+        const ev = std.fmt.allocPrint(arena, "{{\"t\":\"event\",\"channel_id\":\"{s}\",\"client_id\":\"{s}\",\"seq\":0,\"data\":{{\"session_id\":\"{s}\"}}}}", .{ channel_id, client_id, &sess.id }) catch return;
+        rc.send(ev);
+        relayEnd(rc, channel_id, client_id, "complete", null);
+        relaySendSessions(rc);
+        return;
+    }
+
+    if (std.mem.eql(u8, op, "delete")) {
+        const sid = jstr(obj, "session_id") orelse "";
+        relayDropById(rc, sid);
+        relayEnd(rc, channel_id, client_id, "complete", null);
+        relaySendSessions(rc);
+        return;
+    }
+
+    if (std.mem.eql(u8, op, "message")) {
+        const sid = jstr(obj, "session_id") orelse return relayEnd(rc, channel_id, client_id, "error", "no_such_session");
+        rc.st.mutex.lockUncancelable(rc.io);
+        const found = rc.st.find(sid);
+        rc.st.mutex.unlock(rc.io);
+        const sess = found orelse return relayEnd(rc, channel_id, client_id, "error", "no_such_session");
+        const body = obj.get("body") orelse return relayEnd(rc, channel_id, client_id, "error", "protocol_error");
+        const line = std.json.Stringify.valueAlloc(arena, body, .{}) catch return relayEnd(rc, channel_id, client_id, "error", "internal");
+        relayStreamMessage(rc, sess, sid, channel_id, client_id, line);
+        return;
+    }
+
+    relayEnd(rc, channel_id, client_id, "error", "protocol_error");
+}
+
+/// Graceful session close (relay edition of serveDelete — no HTTP response).
+fn relayDropById(rc: *RelayConn, id: []const u8) void {
+    const io = rc.io;
+    rc.st.mutex.lockUncancelable(io);
+    const found = rc.st.find(id);
+    if (found) |sess| {
+        for (rc.st.sessions.items, 0..) |p, i| if (p == sess) {
+            _ = rc.st.sessions.swapRemove(i);
+            break;
+        };
+    }
+    rc.st.mutex.unlock(io);
+    const sess = found orelse return;
+    sess.busy.lockUncancelable(io);
+    sess.busy.unlock(io);
+    if (sess.child.stdin) |f| {
+        f.close(io);
+        sess.child.stdin = null;
+    }
+    rc.st.group.concurrent(io, serveReap, .{ rc.st, sess }) catch serveReap(rc.st, sess);
+}
+
+/// Write one request line to the child and stream its events back as relay
+/// frames until the request's terminal event. Mirrors serveMessage's loop.
+fn relayStreamMessage(rc: *RelayConn, sess: *ServeSession, session_id: []const u8, channel_id: []const u8, client_id: []const u8, line: []const u8) void {
+    const io = rc.io;
+
+    // `answer` is an ack-only side channel: write it through and ack — the
+    // in-flight user stream (another channel) surfaces the resulting events.
+    const is_answer = serveStringField(line, "type") != null and
+        std.mem.eql(u8, serveStringField(line, "type").?, "answer");
+    if (is_answer) {
+        var wb: [1024]u8 = undefined;
+        var cw = sess.child.stdin.?.writerStreaming(io, &wb);
+        cw.interface.writeAll(line) catch return relayEnd(rc, channel_id, client_id, "error", "internal");
+        cw.interface.writeByte('\n') catch {};
+        cw.interface.flush() catch {};
+        serveClearAnswerState(io, sess);
+        return relayEnd(rc, channel_id, client_id, "complete", null);
+    }
+
+    sess.busy.lockUncancelable(io);
+    defer sess.busy.unlock(io);
+    {
+        var wb: [1024]u8 = undefined;
+        var cw = sess.child.stdin.?.writerStreaming(io, &wb);
+        cw.interface.writeAll(line) catch return relayEnd(rc, channel_id, client_id, "error", "transport_reset");
+        cw.interface.writeByte('\n') catch return;
+        cw.interface.flush() catch return relayEnd(rc, channel_id, client_id, "error", "transport_reset");
+    }
+
+    var ev_arena = std.heap.ArenaAllocator.init(rc.gpa);
+    defer ev_arena.deinit();
+    var seq: u64 = 0;
+    while (true) {
+        const ev_line = sess.rdr.interface.takeDelimiter('\n') catch {
+            relayEnd(rc, channel_id, client_id, "error", "transport_reset");
+            serveDrop(rc.st, sess);
+            return;
+        } orelse {
+            relayEnd(rc, channel_id, client_id, "error", "transport_reset");
+            serveDrop(rc.st, sess);
+            return;
+        };
+        const trimmed = std.mem.trim(u8, ev_line, " \t\r");
+        if (trimmed.len == 0) continue;
+        serveUpdateAnswerState(io, sess, trimmed);
+        _ = ev_arena.reset(.retain_capacity);
+        const ev = std.fmt.allocPrint(ev_arena.allocator(), "{{\"t\":\"event\",\"channel_id\":\"{s}\",\"client_id\":\"{s}\",\"seq\":{d},\"data\":{s}}}", .{ channel_id, client_id, seq, trimmed }) catch return;
+        rc.send(ev);
+        seq += 1;
+        const ev_type = serveStringField(trimmed, "type") orelse "";
+        if (std.mem.eql(u8, ev_type, "ask_user")) relayNotify(rc, session_id, "needs_input");
+        if (serveTerminalEvent(trimmed)) {
+            serveClearAnswerState(io, sess);
+            if (std.mem.eql(u8, ev_type, "turn")) relayNotify(rc, session_id, "turn_done");
+            break;
+        }
+    }
+    relayEnd(rc, channel_id, client_id, "complete", null);
 }
 
 // ---------------------------------------------------------------------------
