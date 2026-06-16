@@ -1,0 +1,10 @@
+{
+  "name": "codegraff-relay-dev",
+  "private": true,
+  "type": "module",
+  "description": "Reference relay for the codegraff mobile feature — executable spec of PROTOCOL.md (v1). Local dev only; production relay lives in justrach/muonry.",
+  "scripts": {
+    "start": "bun relay.ts",
+    "test": "bun test-isolation.ts"
+  }
+}
