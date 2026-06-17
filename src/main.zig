@@ -7163,7 +7163,6 @@ fn relayStreamMessage(rc: *RelayConn, sess: *ServeSession, session_id: []const u
         cw.interface.writeByte('\n') catch return;
         cw.interface.flush() catch return relayEnd(rc, channel_id, client_id, "error", "transport_reset");
     }
-
     var ev_arena = std.heap.ArenaAllocator.init(rc.gpa);
     defer ev_arena.deinit();
     var seq: u64 = 0;
@@ -7179,6 +7178,11 @@ fn relayStreamMessage(rc: *RelayConn, sess: *ServeSession, session_id: []const u
         };
         const trimmed = std.mem.trim(u8, ev_line, " \t\r");
         if (trimmed.len == 0) continue;
+        // Only protocol events (JSON objects) are valid as a frame `data` value.
+        // The child can also print plain diagnostic lines to stdout (e.g.
+        // "api error: …"); embedding those raw would make the frame invalid
+        // JSON and the relay would drop the connection — skip them.
+        if (trimmed[0] != '{') continue;
         serveUpdateAnswerState(io, sess, trimmed);
         _ = ev_arena.reset(.retain_capacity);
         const ev = std.fmt.allocPrint(ev_arena.allocator(), "{{\"t\":\"event\",\"channel_id\":\"{s}\",\"client_id\":\"{s}\",\"seq\":{d},\"data\":{s}}}", .{ channel_id, client_id, seq, trimmed }) catch return;
