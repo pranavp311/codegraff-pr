@@ -8562,7 +8562,39 @@ const Agent = struct {
         try bw.writer.writeAll(body);
         try bw.end();
         try req.connection.?.flush();
-        var response = try req.receiveHead(&.{});
+        // Guard the response-header read against the idle-stall watchdog: a
+        // server that accepts the connection but never sends headers (the
+        // half-open / WriteFailed case) would otherwise block here for minutes
+        // on the OS timeout before a retry. Surface a stall as a retryable
+        // HungRequest so request() redials a fresh connection quickly.
+        var response = head_blk: {
+            const HeadDone = union(enum) { head: @TypeOf(req.receiveHead(&.{})), stall: WatchdogFired };
+            var hd_buf: [2]HeadDone = undefined;
+            var hsel: Io.Select(HeadDone) = .init(self.io, &hd_buf);
+            hsel.concurrent(.head, streamHeadTask, .{&req}) catch {
+                break :head_blk try req.receiveHead(&.{}); // no spare concurrency
+            };
+            hsel.concurrent(.stall, streamStallTask, .{self.io}) catch {
+                const r = hsel.await() catch |e| {
+                    hsel.cancelDiscard();
+                    return e;
+                };
+                hsel.cancelDiscard();
+                break :head_blk try r.head;
+            };
+            const fst = hsel.await() catch |e| {
+                hsel.cancelDiscard();
+                return e;
+            };
+            hsel.cancelDiscard();
+            switch (fst) {
+                .head => |r| break :head_blk try r,
+                .stall => |w| {
+                    if (req.connection) |conn| conn.closing = true;
+                    return if (w == .esc) error.Interrupted else error.HungRequest;
+                },
+            }
+        };
 
         // 429/5xx before any body: a retryable throttle — request() backs
         // off and retries (surfaced in the trace as a "retry" note).
@@ -8625,17 +8657,47 @@ const Agent = struct {
                     .stall => |w| {
                         self.flushStreamTail();
                         if (req.connection) |conn| conn.closing = true;
-                        if (w == .deadline and !json_mode) if (self.out) |o| {
-                            o.writeAll("\n⚠ stream stalled — ending turn\n") catch {};
-                            o.flush() catch {};
-                        };
-                        return error.Interrupted;
+                        // A stalled stream is a dead connection, not a user stop:
+                        // surface HungRequest so request()'s loop reconnects and
+                        // retries (Esc still maps to Interrupted, which doesn't).
+                        return if (w == .esc) error.Interrupted else error.HungRequest;
                     },
                 }
             }
-            // End of stream leaves the reader empty; otherwise the '\n' is
-            // still buffered (and consumed below, after the line is handled).
-            const more = if (reader.peekByte()) |_| true else |_| false;
+            // Is there another buffered line, or is the stream done? A bare
+            // reader.peekByte() blocks forever on a half-open socket (server
+            // gone, no FIN/RST) - the unguarded probe that wedged retries at
+            // "thinking". Race it against the same idle-stall watchdog as the
+            // line read above; a stall becomes a retryable HungRequest.
+            const more = more_blk: {
+                const PeekDone = union(enum) { byte: anyerror!u8, stall: WatchdogFired };
+                var pk_buf: [2]PeekDone = undefined;
+                var psel: Io.Select(PeekDone) = .init(self.io, &pk_buf);
+                psel.concurrent(.byte, streamPeekTask, .{reader}) catch {
+                    break :more_blk if (reader.peekByte()) |_| true else |_| false; // no spare concurrency
+                };
+                psel.concurrent(.stall, streamStallTask, .{self.io}) catch {
+                    const r = psel.await() catch |e| {
+                        psel.cancelDiscard();
+                        return e;
+                    };
+                    psel.cancelDiscard();
+                    break :more_blk if (r.byte) |_| true else |_| false;
+                };
+                const fst = psel.await() catch |e| {
+                    psel.cancelDiscard();
+                    return e;
+                };
+                psel.cancelDiscard();
+                switch (fst) {
+                    .byte => |b| break :more_blk if (b) |_| true else |_| false,
+                    .stall => |w| {
+                        self.flushStreamTail();
+                        if (req.connection) |conn| conn.closing = true;
+                        return if (w == .esc) error.Interrupted else error.HungRequest;
+                    },
+                }
+            };
             try full.writer.writeAll(line.writer.buffered());
             try full.writer.writeByte('\n');
             self.printDelta(line.writer.buffered());
@@ -10306,6 +10368,21 @@ const stream_stall_ms: u64 = 120 * 1000;
 /// Select-arm wrapper: read one '\n'-delimited SSE line into `w`.
 fn streamLineTask(reader: *Io.Reader, w: *Io.Writer) anyerror!usize {
     return reader.streamDelimiterEnding(w, '\n');
+}
+
+/// Select-arm wrapper: block until one more byte is available (or EOF/error).
+/// Guards the post-line "is there more?" probe so a half-open socket can't
+/// wedge the stream read at "thinking" (see postStream's `more` block).
+fn streamPeekTask(reader: *Io.Reader) anyerror!u8 {
+    return reader.peekByte();
+}
+
+/// Select-arm wrapper: read the HTTP response head. Guards the pre-stream
+/// header wait so a server that connects but never sends headers (a half-open
+/// socket) can't hang the turn for minutes on the OS timeout before the first
+/// byte - the receiveHead analogue of streamPeekTask.
+fn streamHeadTask(req: *std.http.Client.Request) @TypeOf(@as(*std.http.Client.Request, undefined).receiveHead(&.{})) {
+    return req.receiveHead(&.{});
 }
 
 /// Select-arm wrapper: fires after stream_stall_ms of no line (idle stall), or
