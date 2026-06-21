@@ -34,3 +34,16 @@ Never build a capability into the GUI (or app) that the TUI harness doesn't have
 Example: the ultracode / `workflow` multi-agent fan-out already renders in the TUI
 (each subagent shows as a launch/done card); the GUI must be updated to consume the
 same per-subagent `--json` events (a live agent tree), not given a divergent path.
+
+**Keep the GUI and engine in lockstep — the GUI must work out of the box.** A
+protocol change (a new `--json` event, or a control request like `set_model`) must
+land in *both* the engine (`src/main.zig`) and the GUI consumer
+(`gui/src-tauri/src/runtime/simple.rs`) in the same change — and the GUI must run
+against a freshly-rebuilt `graff`. Never let `simple.rs` get ahead of the deployed
+binary: the GUI sending `set_model {model, provider}` to a stale binary that only
+knew `{name}` is exactly the failure to avoid ("graff session exited before
+acknowledging control request"). So after any `src/main.zig` change, rebuild graff
+**and** redeploy the bundled binary — the externalBin sidecar
+(`gui/src-tauri/binaries/graff-aarch64-apple-darwin`) **and** the resolver path the
+running app uses (`current_exe()/../graff`, i.e. the shared target's `graff`; a
+`tauri_build` rebuild re-copies the sidecar over it) — so the GUI picks it up.
