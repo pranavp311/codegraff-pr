@@ -79,7 +79,7 @@ var unattended = false; // -p one-shot: no human to prompt; unapproved tool call
 const schema_protocol_json =
     \\{
     \\  "transport": "newline-delimited JSON over stdin/stdout (--json)",
-    \\  "request": "one JSON object per line: {\"type\":\"user\",\"text\":\"...\"} sends a user turn; {\"type\":\"answer\",\"text\":\"...\",\"cancelled\":false,\"call_id\":\"optional\"} answers an active ask_user event; {\"type\":\"set_system_prompt\",\"text\":\"...\",\"append\":false} replaces (or with append=true extends) the system prompt between turns and acks with a system_prompt event; {\"type\":\"set_model\",\"name\":\"provider|provider/model|model\"}, {\"type\":\"compact\"}, {\"type\":\"set_mode\",\"mode\":\"plan|normal\"}, and {\"type\":\"set_agent\",\"id\":\"reviewer\"}, {\"type\":\"set_effort\",\"level\":\"low|medium|high\"}, and {\"type\":\"set_fast\",\"on\":true} are live control requests acked by model/compact/mode/agent/effort/fast events. NOTE: the system prompt heads the KV-cached prefix, so any mutation invalidates the cache for the whole conversation (per Manus context-engineering lessons) — set it at spawn when possible and mutate only at task boundaries",
+    \\  "request": "one JSON object per line: {\"type\":\"user\",\"text\":\"...\"} sends a user turn; {\"type\":\"answer\",\"text\":\"...\",\"cancelled\":false,\"call_id\":\"optional\"} answers an active ask_user event; {\"type\":\"set_system_prompt\",\"text\":\"...\",\"append\":false} replaces (or with append=true extends) the system prompt between turns and acks with a system_prompt event; {\"type\":\"set_model\",\"name\":\"provider|provider/model|model\"}, {\"type\":\"compact\"}, {\"type\":\"set_mode\",\"mode\":\"plan|normal\"}, {\"type\":\"set_agent\",\"id\":\"reviewer\"}, {\"type\":\"set_effort\",\"level\":\"low|medium|high\"}, {\"type\":\"set_fast\",\"on\":true}, and {\"type\":\"set_ultracode\",\"on\":true} are live control requests acked by model/compact/mode/agent/effort/fast/ultracode events. NOTE: the system prompt heads the KV-cached prefix, so any mutation invalidates the cache for the whole conversation (per Manus context-engineering lessons) — set it at spawn when possible and mutate only at task boundaries",
     \\  "score_request": "{\"type\":\"score\",\"prompt_sha\":\"<16 hex>\",\"score\":0.7,\"notes\":\"...\",\"parent_sha\":\"<16 hex, optional>\"} appends an evaluation record for an agent/prompt variant to harness.trajectory.jsonl (the append-only DGM-style archive; prompt_sha = first 8 bytes of SHA-256 of the system prompt, hex; parent_sha records which prompt this variant was mutated from — the lineage edge DGM parent selection counts children with) and acks with a score event",
     \\  "events": [
     \\    {"type": "text", "text": "assistant text delta"},
@@ -95,6 +95,7 @@ const schema_protocol_json =
     \\    {"type": "agent", "ok": true, "id": "reviewer", "chars": 0},
     \\    {"type": "effort", "ok": true, "level": "medium", "applies": true},
     \\    {"type": "fast", "ok": true, "on": true, "applies": true},
+    \\    {"type": "ultracode", "ok": true, "on": true},
     \\    {"type": "score", "ok": true, "prompt_sha": "..."},
     \\    {"type": "error", "message": "..."}
     \\  ]
@@ -236,6 +237,47 @@ const CostTally = struct {
 };
 
 var g_cost: CostTally = .{};
+
+/// Per-agent/per-turn usage snapshot persisted into harness.trajectory.jsonl.
+/// This mirrors Claude Code's useful bit: each assistant/run node carries enough
+/// token counters to compute spend later without reparsing provider responses.
+const UsageTally = struct {
+    input_tokens: u64 = 0, // uncached + cache-write input
+    cache_read_input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+    api_calls: u64 = 0,
+    cost_usd: f64 = 0,
+    subscription_calls: u64 = 0,
+    unpriced_calls: u64 = 0,
+
+    fn add(self: *UsageTally, provider_id: []const u8, model: []const u8, uncached_in: i64, cache_in: i64, out: i64) void {
+        self.api_calls += 1;
+        self.input_tokens += @intCast(@max(uncached_in, 0));
+        self.cache_read_input_tokens += @intCast(@max(cache_in, 0));
+        self.output_tokens += @intCast(@max(out, 0));
+        switch (billingFor(provider_id, model)) {
+            .sub => self.subscription_calls += 1,
+            .unpriced => self.unpriced_calls += 1,
+            .priced => self.cost_usd += usdFor(priceFor(model).?, uncached_in, cache_in, out),
+        }
+    }
+
+    fn diff(self: UsageTally, before: UsageTally) UsageTally {
+        return .{
+            .input_tokens = subSatU64(self.input_tokens, before.input_tokens),
+            .cache_read_input_tokens = subSatU64(self.cache_read_input_tokens, before.cache_read_input_tokens),
+            .output_tokens = subSatU64(self.output_tokens, before.output_tokens),
+            .api_calls = subSatU64(self.api_calls, before.api_calls),
+            .cost_usd = if (self.cost_usd >= before.cost_usd) self.cost_usd - before.cost_usd else 0,
+            .subscription_calls = subSatU64(self.subscription_calls, before.subscription_calls),
+            .unpriced_calls = subSatU64(self.unpriced_calls, before.unpriced_calls),
+        };
+    }
+};
+
+fn subSatU64(a: u64, b: u64) u64 {
+    return if (a >= b) a - b else 0;
+}
 
 /// Wire format + auth style + endpoint per provider. Base URLs and env-var
 /// names from models.dev/api.json (snapshot 2026-06-10); the anthropic and
@@ -2014,7 +2056,7 @@ fn loadOrCreateId(io: Io, gpa: Allocator, home: []const u8, fname: []const u8) [
 /// Reasoning depth for codex/responses (OpenAI Responses `reasoning.effort`).
 const ReasoningEffort = enum { low, medium, high };
 
-const repl_commands = [_][]const u8{ "/model", "/models", "/clear", "/plan", "/key", "/keepcontext", "/effort", "/fast", "/reasoning", "/strict", "/yolo", "/trace", "/trajectory", "/agents", "/skills", "/hooks", "/compact", "/rewind", "/image", "/paste", "/save", "/resume", "/sessions", "/todo", "/jobs", "/cost", "/animation", "/mcp", "/help" };
+const repl_commands = [_][]const u8{ "/model", "/models", "/clear", "/plan", "/key", "/keepcontext", "/effort", "/fast", "/ultracode", "/reasoning", "/strict", "/yolo", "/trace", "/trajectory", "/agents", "/skills", "/hooks", "/compact", "/rewind", "/image", "/paste", "/save", "/resume", "/sessions", "/todo", "/jobs", "/cost", "/animation", "/mcp", "/help" };
 
 /// Lifecycle hooks (codex/Claude-style), loaded once at startup from
 /// .harness/settings.json's "hooks" object. Three events:
@@ -2407,6 +2449,39 @@ var g_anim_index: usize = 0; // /animation selection (index into anims)
 var g_anim_random = false; // pick a fresh one per request
 var g_anim_off = false; // /animation off
 var g_anim_current: usize = 0; // what spinnerTask draws right now
+var g_shine_phase: usize = 0; // ultracode input-wave animation frame
+
+/// 9-stop truecolor rainbow for the `ultracode` shine (banner + live input).
+const ultracode_rainbow = [_][]const u8{
+    "\x1b[38;2;255;87;51m",  "\x1b[38;2;255;159;28m", "\x1b[38;2;255;222;51m",
+    "\x1b[38;2;120;255;51m", "\x1b[38;2;51;255;170m", "\x1b[38;2;51;170;255m",
+    "\x1b[38;2;120;51;255m", "\x1b[38;2;210;51;255m", "\x1b[38;2;255;51;159m",
+};
+
+/// `ultracode` codeword banner: a rainbow shine sweeps across the word in
+/// interactive color mode when the codeword engages multi-agent workflow mode.
+/// Truecolor ANSI; best-effort (any write failure aborts silently).
+fn ultracodeShine(w: *Io.Writer, io: Io) void {
+    if (!use_color) return;
+    const word = "ULTRACODE";
+    const gold = "\x1b[38;2;255;215;0m";
+    const frames = 14;
+    var f: usize = 0;
+    while (f < frames) : (f += 1) {
+        w.writeAll("\r\x1b[2K") catch return;
+        w.writeAll(style.bold) catch return;
+        w.print("{s}✦ ", .{gold}) catch return;
+        for (word, 0..) |c, i| {
+            w.writeAll(ultracode_rainbow[(i + f) % ultracode_rainbow.len]) catch return;
+            w.print("{c}", .{c}) catch return;
+        }
+        w.print("{s} ✦{s}", .{ gold, style.reset }) catch return;
+        w.flush() catch return;
+        io.sleep(.fromMilliseconds(70), .awake) catch {};
+    }
+    w.writeAll("\n") catch {};
+    w.flush() catch {};
+}
 
 fn animIndex(name: []const u8) ?usize {
     for (anims, 0..) |a, i| if (std.mem.eql(u8, a.name, name)) return i;
@@ -2725,10 +2800,117 @@ fn termCols() usize {
     return ws.col;
 }
 
+/// Convert the visible width of the prompt we just printed into the 1-based
+/// cursor column where input starts. DSR returns a physical terminal column,
+/// not the total number of prompt cells, so the no-DSR fallback must wrap the
+/// saved prompt width through the current terminal width. Without this, a long
+/// model/context badge that wrapped would make redraw think the prompt occupied
+/// e.g. 100 columns on the current row and it would push the input onto a naked
+/// line or clear from the wrong place.
+fn promptFallbackCol(prompt_cols: usize, cols: usize) usize {
+    if (prompt_cols == 0) return 1;
+    const c = if (cols == 0) 80 else cols;
+    const rem = prompt_cols % c;
+    // If the prompt ended exactly in the last column, there is no column after
+    // it on that row. Keep plen == c so redraw preserves the prompt row and
+    // realizes the first input byte on the following row.
+    return if (rem == 0) c + 1 else rem + 1;
+}
+
+/// DSR replies are best-effort: terminal multiplexers can deliver a stale reply
+/// from an earlier prompt. A stale column 1 is especially destructive because
+/// redraw treats it as "no prompt prefix" and clears the prompt before writing
+/// input. Keep the prompt-width fallback when a reply is implausibly far left.
+fn promptDsrColOrFallback(dsr_col: ?usize, fallback_col: usize, cols: usize) usize {
+    const col = dsr_col orelse return fallback_col;
+    if (fallback_col <= 1) return col;
+    const c = if (cols == 0) 80 else cols;
+
+    // An exact right-edge prompt leaves the terminal in pending-wrap state;
+    // DSR may report either the last prompt column or the next row. Keep the
+    // fallback sentinel (plen == c) so redraw realizes input on the following row.
+    if (fallback_col == c + 1) return fallback_col;
+
+    // Col 1 would put the edit buffer on a naked line and erase the visible
+    // prompt on the first redraw.
+    if (col == 1) return fallback_col;
+
+    // Unicode width differences can move the DSR column slightly, but a reply
+    // much earlier than the known prompt width is almost certainly stale.
+    if (fallback_col <= c and col + 4 < fallback_col) return fallback_col;
+    return col;
+}
+
 fn inputPending(fd: std.posix.fd_t) bool {
     var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
     const n = std.posix.poll(&fds, 50) catch return false;
     return n > 0;
+}
+
+/// Like inputPending but with a configurable poll timeout (ms). Used by the
+/// ultracode wave to tick at a slower, calmer cadence than the 50ms default.
+fn inputPendingTimed(fd: std.posix.fd_t, timeout_ms: i32) bool {
+    var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    const n = std.posix.poll(&fds, timeout_ms) catch return false;
+    return n > 0;
+}
+
+/// Raw RGB stops for the ultracode wave (mirrors ultracode_rainbow's hues).
+const ultracode_rgb = [_]struct { r: u8, g: u8, b: u8 }{
+    .{ .r = 255, .g = 87, .b = 51 },
+    .{ .r = 255, .g = 159, .b = 28 },
+    .{ .r = 255, .g = 222, .b = 51 },
+    .{ .r = 120, .g = 255, .b = 51 },
+    .{ .r = 51, .g = 255, .b = 170 },
+    .{ .r = 51, .g = 170, .b = 255 },
+    .{ .r = 120, .g = 51, .b = 255 },
+    .{ .r = 210, .g = 51, .b = 255 },
+    .{ .r = 255, .g = 51, .b = 159 },
+};
+
+/// Smoothly interpolated rainbow hue for the ultracode wave. `pos_q8` is a
+/// 0..2048 fraction across the 9-stop palette (8 bits index + 8 bits blend),
+/// so the wave glides between colors instead of snapping. A gentle brightness
+/// breath gives a rhythmic pulse rather than a mechanical scroll.
+fn ultracodeWaveHue(w: *Io.Writer, pos_q8: u16, phase: usize) void {
+    const pal = &ultracode_rgb;
+    const len: u16 = pal.len;
+    const phase_offset: u16 = @truncate(phase *% 32);
+    const p: u16 = pos_q8 +% phase_offset;
+    const idx: u16 = (p >> 8) % len;
+    const frac: u16 = p & 0xff;
+    const a = pal[idx];
+    const b = pal[(idx + 1) % len];
+    const r: i32 = @as(i32, a.r) + @divTrunc((@as(i32, b.r) - @as(i32, a.r)) * @as(i32, frac), 256);
+    const g: i32 = @as(i32, a.g) + @divTrunc((@as(i32, b.g) - @as(i32, a.g)) * @as(i32, frac), 256);
+    const bl: i32 = @as(i32, a.b) + @divTrunc((@as(i32, b.b) - @as(i32, a.b)) * @as(i32, frac), 256);
+    const breath: u16 = switch (phase % 20) {
+        0 => 120,
+        1 => 120,
+        2 => 118,
+        3 => 117,
+        4 => 114,
+        5 => 112,
+        6 => 110,
+        7 => 107,
+        8 => 106,
+        9 => 104,
+        10 => 104,
+        11 => 104,
+        12 => 106,
+        13 => 107,
+        14 => 110,
+        15 => 112,
+        16 => 114,
+        17 => 117,
+        18 => 118,
+        else => 120,
+    };
+    const sc: i32 = @as(i32, breath);
+    const cr: u8 = @intCast(@max(0, @min(255, @divTrunc(r * sc, 128))));
+    const cg: u8 = @intCast(@max(0, @min(255, @divTrunc(g * sc, 128))));
+    const cb: u8 = @intCast(@max(0, @min(255, @divTrunc(bl * sc, 128))));
+    w.print("\x1b[38;2;{d};{d};{d}m", .{ cr, cg, cb }) catch {};
 }
 
 /// Directories the `@` file picker never descends into (every dot-dir is
@@ -2900,7 +3082,11 @@ fn readLine(
     // shifts the whole block together and never strands the prompt. Typed-
     // ahead text bytes that race the reply are replayed into the edit loop
     // below; a typed-ahead escape sequence inside that ~ms window is dropped.
-    var prompt_col: usize = 1; // 1-based column where the buffer renders
+    // If the terminal never answers DSR (or its reply is lost), derive the
+    // physical cursor column from the last prompt width and current terminal
+    // width. The prompt may have wrapped, so this is not simply width + 1.
+    const fallback_prompt_col = promptFallbackCol(root.last_prompt_cols, termCols());
+    var prompt_col: usize = fallback_prompt_col; // 1-based column where the buffer renders
     var rstate: LineRender = .{}; // rows used + cursor row of the last redraw
     var pending: std.ArrayList(u8) = .empty;
     defer pending.deinit(gpa);
@@ -2915,8 +3101,8 @@ fn readLine(
         while (true) {
             if (in.buffered().len == 0 and !inputPending(fd)) { // 50ms poll
                 polls += 1;
-                if (polls >= 10) break :dsr; // no reply in ~500ms: fall back
-                // to column 1 — a later reply is still adopted (CSI 'R').
+                if (polls >= 10) break :dsr; // no reply in ~500ms: keep the
+                // prompt-width fallback; a later reply is still adopted (CSI 'R').
                 continue;
             }
             const b = in.takeByte() catch break :dsr;
@@ -2940,7 +3126,7 @@ fn readLine(
             }
             if (n >= 2 and b >= 0x40 and b <= 0x7e) { // CSI final byte
                 if (b == 'R') { // the reply: ESC [ row ; col R
-                    prompt_col = parseDsrCol(esc[0..n]) orelse 1;
+                    prompt_col = promptDsrColOrFallback(parseDsrCol(esc[0..n]), fallback_prompt_col, termCols());
                     break :dsr;
                 }
                 in_esc = false; // some other CSI typed ahead — drop it
@@ -2988,6 +3174,24 @@ fn readLine(
             var vcol: usize = plen;
             var mark_end: usize = 0;
             var mark_open = false;
+            // `ultracode` shines the input itself: each letter of every
+            // (case-insensitive) occurrence renders in a rotating rainbow hue.
+            var shine_starts: [8]usize = undefined;
+            var shine_ends: [8]usize = undefined;
+            var nshine: usize = 0;
+            if (use_color) {
+                var si: usize = 0;
+                while (si + 9 <= items.len) : (si += 1) {
+                    if (std.ascii.eqlIgnoreCase(items[si .. si + 9], "ultracode")) {
+                        if (nshine < shine_starts.len) {
+                            shine_starts[nshine] = si;
+                            shine_ends[nshine] = si + 9;
+                            nshine += 1;
+                        }
+                    }
+                }
+            }
+            var shine_active = false;
             while (i < items.len) {
                 if (vcol >= cols) { // row full → wrap to the next
                     o.writeAll("\r\n") catch {};
@@ -3001,9 +3205,30 @@ fn readLine(
                         if (std.mem.eql(u8, items[i .. i + m.len], m) and m.len > best) best = m.len;
                     }
                     if (best > 0) {
+                        if (shine_active) {
+                            o.writeAll("\x1b[0m") catch {};
+                            shine_active = false;
+                        }
                         o.writeAll("\x1b[7;36m") catch {};
                         mark_end = i + best;
                         mark_open = true;
+                    }
+                }
+                // Rainbow shine for an `ultracode` span (skipped inside a chip).
+                if (!mark_open and nshine > 0) {
+                    var in_shine = false;
+                    for (shine_starts[0..nshine], shine_ends[0..nshine]) |sstart, send| {
+                        if (i >= sstart and i < send) {
+                            ultracodeWaveHue(o, @intCast((i - sstart) * 256), g_shine_phase);
+                            in_shine = true;
+                            break;
+                        }
+                    }
+                    if (in_shine) {
+                        shine_active = true;
+                    } else if (shine_active) {
+                        o.writeAll("\x1b[0m") catch {};
+                        shine_active = false;
                     }
                 }
                 o.writeByte(items[i]) catch {};
@@ -3012,9 +3237,10 @@ fn readLine(
                 if (mark_open and i == mark_end) {
                     o.writeAll("\x1b[0m") catch {};
                     mark_open = false;
+                    shine_active = false;
                 }
             }
-            if (mark_open) o.writeAll("\x1b[0m") catch {};
+            if (mark_open or shine_active) o.writeAll("\x1b[0m") catch {};
 
             // Place the cursor. wrapAt gives its target row/col; when it sits
             // at the very end of a just-filled row that's a fresh row below the
@@ -3105,7 +3331,19 @@ fn readLine(
             const b = pending.items[pend_i];
             pend_i += 1;
             break :blk b;
-        } else in.takeByte() catch return null;
+        } else blk: {
+            // While the input contains `ultracode`, wave the rainbow shine
+            // across the letters: poll for input with a slower 110ms timeout,
+            // and on each idle tick advance the phase + redraw so the hue
+            // glides and breathes (~9fps, calm + rhythmic rather than a fast
+            // flicker). Raw ANSI is gated by use_color, matching the REPL style.
+            while (use_color and std.ascii.indexOfIgnoreCase(buf.items, "ultracode") != null) {
+                if (inputPendingTimed(fd, 110)) break; // keystroke ready — read it below
+                g_shine_phase +%= 1;
+                redraw(out, buf.items, cur, marks.items, &rstate, prompt_col);
+            }
+            break :blk in.takeByte() catch return null;
+        };
         if (c != 0x09) comp_active = false; // any non-Tab key ends the cycle
         switch (c) {
             0x09 => { // Tab: complete, or cycle through matches on repeat
@@ -3307,19 +3545,18 @@ fn readLine(
                     },
                     'R' => { // late DSR cursor-position reply (slow or
                         // multiplexed terminal missed the 500ms startup
-                        // window): adopt the real input column so the
-                        // horizontal window stays exact instead of the
-                        // column-1 fallback. Same narrow-terminal policy as
-                        // startup: too little room after the prompt → the
-                        // input moves to its own row.
+                        // window): adopt the real input column when plausible
+                        // so Unicode-width differences stay exact, but ignore
+                        // stale replies that would erase the prompt. Same
+                        // narrow-terminal policy as startup: too little room
+                        // after the prompt → the input moves to its own row.
                         if (std.mem.indexOfScalar(u8, ps, ';')) |semi| {
-                            const col = std.fmt.parseInt(usize, ps[semi + 1 ..], 10) catch 0;
-                            if (col > 0) {
-                                if (termCols() < col + 16) {
-                                    out.writeAll("\r\n") catch {};
-                                    prompt_col = 1;
-                                } else prompt_col = col;
-                            }
+                            const parsed_col = std.fmt.parseInt(usize, ps[semi + 1 ..], 10) catch 0;
+                            const col = promptDsrColOrFallback(if (parsed_col > 0) parsed_col else null, fallback_prompt_col, termCols());
+                            if (termCols() < col + 16) {
+                                out.writeAll("\r\n") catch {};
+                                prompt_col = 1;
+                            } else prompt_col = col;
                         }
                         redraw(out, buf.items, cur, marks.items, &rstate, prompt_col);
                     },
@@ -4298,10 +4535,41 @@ pub fn main(init: std.process.Init) !void {
         root.stream_quiet = true;
         try root.messages.append(try textMessage(arena, "user", prompt_text));
         if (g_telem) |t| t.countTurn();
+        const turn_id: u64 = if (g_traj) |tj| blk: {
+            const id = tj.nextId();
+            tj.setTurn(id);
+            break :blk id;
+        } else 0;
+        root.tools_used.clear(io);
+        const usage_before = root.usage;
+        const turn_started = Io.Timestamp.now(io, .awake);
         const final_text = root.runTurn() catch |err| switch (err) {
             error.ApiError => std.process.fatal("{s}", .{root.last_api_error orelse "api error"}),
             else => |e| std.process.fatal("turn failed: {t}", .{e}),
         };
+        if (g_traj) |tj| {
+            const fp = promptFingerprint(root.systemPrompt());
+            const turn_ms: i64 = @intCast(@max(0, turn_started.untilNow(io, .awake).toMilliseconds()));
+            const turn_tools = root.tools_used.render(arena);
+            const turn_usage = root.usage.diff(usage_before);
+            tj.capturePrompt(fp, root.systemPrompt());
+            tj.node(.{
+                .id = turn_id,
+                .parent = 0,
+                .kind = "turn",
+                .label = root.provider.model,
+                .t = tj.elapsedMs(),
+                .ms = turn_ms,
+                .prompt_sha = &fp,
+                .prompt_mutated = false,
+                .task = utf8Prefix(prompt_text, 160),
+                .tools = turn_tools,
+                .ok = true,
+                .context_tokens = root.last_context_tokens,
+                .usage = turn_usage,
+            });
+            if (g_telem) |t| t.runEvent(&fp, false, true, turn_ms, turn_tools);
+        }
         try out.print("{s}\n", .{final_text});
         try out.flush();
         // Usage summary → stderr, so stdout stays exactly the answer.
@@ -4462,6 +4730,12 @@ pub fn main(init: std.process.Init) !void {
                 root.emit(.{ .type = "fast", .ok = true, .on = on, .applies = root.provider.kind == .responses });
                 continue;
             }
+            if (std.mem.eql(u8, rtype, "set_ultracode")) {
+                const on = if (parsed.object.get("on")) |v| (if (v == .bool) v.bool else false) else false;
+                root.ultracode_mode = on;
+                root.emit(.{ .type = "ultracode", .ok = true, .on = on });
+                continue;
+            }
             if (std.mem.eql(u8, rtype, "score")) {
                 const sha = if (parsed.object.get("prompt_sha")) |v| (if (v == .string) v.string else "") else "";
                 const sc: f64 = if (parsed.object.get("score")) |v| switch (v) {
@@ -4552,10 +4826,17 @@ pub fn main(init: std.process.Init) !void {
         // model can see (otherwise it only gets the path and resorts to OCR).
         stageGuiImageAttachment(&root, msg);
 
-        // "ultracode" codeword: opt this turn into multi-agent workflow mode.
-        if (std.ascii.indexOfIgnoreCase(msg, "ultracode") != null) {
+        // "ultracode" codeword or persistent /ultracode mode: opt this turn
+        // into multi-agent workflow mode. The prompt is augmented once even if
+        // the mode is on and the user also typed the codeword.
+        if (std.ascii.indexOfIgnoreCase(msg, "ultracode") != null or root.ultracode_mode) {
             if (!json_mode) {
-                try out.writeAll("⚡ ultracode — multi-agent workflow mode engaged\n");
+                if (interactive and use_color) {
+                    ultracodeShine(out, io);
+                    try out.print("{s}⚡ ultracode orchestration{s} — workflow/subagents requested for this turn\n", .{ style.cyan, style.reset });
+                } else {
+                    try out.writeAll("⚡ ultracode orchestration — workflow/subagents requested for this turn\n");
+                }
                 try out.flush();
             }
             tracer.note("ultracode", msg[0..@min(msg.len, 120)]);
@@ -4593,6 +4874,7 @@ pub fn main(init: std.process.Init) !void {
             break :blk id;
         } else 0;
         root.tools_used.clear(io); // per-turn tool log for the turn's node
+        const usage_before = root.usage; // per-turn delta for trajectory accounting
         const turn_started = Io.Timestamp.now(io, .awake);
         // A failed turn must never kill the session: ApiError is already
         // reported inside request(); anything else is surfaced here. Either
@@ -4603,6 +4885,7 @@ pub fn main(init: std.process.Init) !void {
             const turn_ms: i64 = @intCast(@max(0, turn_started.untilNow(io, .awake).toMilliseconds()));
             const turn_ok = if (turn_result) |_| true else |_| false;
             const turn_tools = root.tools_used.render(arena);
+            const turn_usage = root.usage.diff(usage_before);
             tj.capturePrompt(fp, root.systemPrompt());
             tj.node(.{
                 .id = turn_id,
@@ -4617,6 +4900,7 @@ pub fn main(init: std.process.Init) !void {
                 .tools = turn_tools,
                 .ok = turn_ok,
                 .context_tokens = root.last_context_tokens,
+                .usage = turn_usage,
             });
             if (g_telem) |t| t.runEvent(&fp, !std.mem.eql(u8, &fp, &prev_prompt_fp), turn_ok, turn_ms, turn_tools);
             prev_turn_id = turn_id;
@@ -5102,10 +5386,11 @@ const command_menu = [_]PickItem{
     .{ .name = "/effort", .desc = "thinking depth: low|medium|high (codex, deepseek, codegraff)" },
     .{ .name = "/reasoning", .desc = "alias for /effort" },
     .{ .name = "/fast", .desc = "codex priority service tier — lower latency (gpt-5.5)" },
+    .{ .name = "/ultracode", .desc = "toggle persistent ultracode (multi-agent workflow) mode" },
     .{ .name = "/image", .desc = "attach an image to the next message" },
     .{ .name = "/paste", .desc = "attach the clipboard image" },
     .{ .name = "/trace", .desc = "toggle the JSONL event trace" },
-    .{ .name = "/trajectory", .desc = "show this session's agent tree (DGM-style)" },
+    .{ .name = "/trajectory", .desc = "show this session's agent tree + token/cost totals" },
     .{ .name = "/agents", .desc = "list agent types (builtins + .harness/agents)" },
     .{ .name = "/skills", .desc = "optional companion tools: list, /skills add|remove <name>" },
     .{ .name = "/hooks", .desc = "list lifecycle hooks (pre_tool/post_tool/turn_end)" },
@@ -5320,6 +5605,24 @@ fn handleCommand(root: *Agent, keys: *Keys, arena: Allocator, line: []const u8, 
                 const v = o.get(k) orelse return false;
                 return v == .bool and v.bool;
             }
+            fn usageObj(o: std.json.ObjectMap) ?std.json.ObjectMap {
+                const v = o.get("usage") orelse return null;
+                return if (v == .object) v.object else null;
+            }
+            fn usageInt(o: std.json.ObjectMap, k: []const u8) u64 {
+                const u = usageObj(o) orelse return 0;
+                const v = u.get(k) orelse return 0;
+                return if (v == .integer and v.integer > 0) @intCast(v.integer) else 0;
+            }
+            fn usageFloat(o: std.json.ObjectMap, k: []const u8) f64 {
+                const u = usageObj(o) orelse return 0;
+                const v = u.get(k) orelse return 0;
+                return switch (v) {
+                    .float => |x| x,
+                    .integer => |x| @floatFromInt(x),
+                    else => 0,
+                };
+            }
             // Latest score recorded for a prompt fingerprint, across the
             // whole archive (scores persist between sessions).
             fn scoreFor(all: []const std.json.ObjectMap, sha: []const u8) ?f64 {
@@ -5351,8 +5654,18 @@ fn handleCommand(root: *Agent, keys: *Keys, arena: Allocator, line: []const u8, 
         }
         const session = objs.items[session_start..];
         var turns: usize = 0;
+        var total_usage: UsageTally = .{};
         for (session) |o| {
             if (std.mem.eql(u8, S.str(o, "kind"), "turn")) turns += 1;
+            if (S.usageObj(o) != null) {
+                total_usage.input_tokens += S.usageInt(o, "input_tokens");
+                total_usage.cache_read_input_tokens += S.usageInt(o, "cache_read_input_tokens");
+                total_usage.output_tokens += S.usageInt(o, "output_tokens");
+                total_usage.api_calls += S.usageInt(o, "api_calls");
+                total_usage.subscription_calls += S.usageInt(o, "subscription_calls");
+                total_usage.unpriced_calls += S.usageInt(o, "unpriced_calls");
+                total_usage.cost_usd += S.usageFloat(o, "cost_usd");
+            }
         }
         if (turns == 0) {
             try out.writeAll("no trajectory recorded yet — run a turn first (the archive lives in harness.trajectory.jsonl)\n");
@@ -5360,6 +5673,18 @@ fn handleCommand(root: *Agent, keys: *Keys, arena: Allocator, line: []const u8, 
             return;
         }
         try out.print("{s}session trajectory{s} — {d} turn(s); archive: {s} ({d} record(s) total)\n", .{ style.bold, style.reset, turns, trajectory_path, objs.items.len });
+        if (total_usage.api_calls > 0) {
+            try out.print("  usage: {d} api call(s) · {d} in ({d} cached) + {d} out tokens · ${d:.4}", .{
+                total_usage.api_calls,
+                total_usage.input_tokens + total_usage.cache_read_input_tokens,
+                total_usage.cache_read_input_tokens,
+                total_usage.output_tokens,
+                total_usage.cost_usd,
+            });
+            if (total_usage.subscription_calls > 0) try out.print(" · {d} subscription call(s)", .{total_usage.subscription_calls});
+            if (total_usage.unpriced_calls > 0) try out.print(" · {d} unpriced call(s)", .{total_usage.unpriced_calls});
+            try out.writeAll("\n");
+        }
         for (session) |o| {
             if (!std.mem.eql(u8, S.str(o, "kind"), "turn")) continue;
             const turn_id = S.int(o, "id");
@@ -5377,6 +5702,24 @@ fn handleCommand(root: *Agent, keys: *Keys, arena: Allocator, line: []const u8, 
             }) catch {};
             if (S.scoreFor(objs.items, S.str(o, "prompt_sha"))) |sc|
                 out.print(" {s}· score {d:.2}{s}", .{ style.green, sc, style.reset }) catch {};
+            const turn_api = S.usageInt(o, "api_calls");
+            if (turn_api > 0) {
+                out.print(" {s}· {d} api · {d} in ({d} cached) + {d} out{s}", .{
+                    style.dim,
+                    turn_api,
+                    S.usageInt(o, "input_tokens") + S.usageInt(o, "cache_read_input_tokens"),
+                    S.usageInt(o, "cache_read_input_tokens"),
+                    S.usageInt(o, "output_tokens"),
+                    style.reset,
+                }) catch {};
+                const usd = S.usageFloat(o, "cost_usd");
+                if (usd > 0)
+                    out.print(" {s}· ${d:.4}{s}", .{ style.green, usd, style.reset }) catch {}
+                else if (S.usageInt(o, "subscription_calls") > 0)
+                    out.print(" {s}· sub{s}", .{ style.cyan, style.reset }) catch {}
+                else if (S.usageInt(o, "unpriced_calls") > 0)
+                    out.print(" {s}· unpriced{s}", .{ style.yellow, style.reset }) catch {};
+            }
             out.writeAll("\n") catch {};
             // children: subagents / workflow tasks spawned during this turn
             var remaining: usize = 0;
@@ -5399,6 +5742,24 @@ fn handleCommand(root: *Agent, keys: *Keys, arena: Allocator, line: []const u8, 
                 }) catch {};
                 if (S.scoreFor(objs.items, S.str(c, "prompt_sha"))) |sc|
                     out.print(" {s}· score {d:.2}{s}", .{ style.green, sc, style.reset }) catch {};
+                const child_api = S.usageInt(c, "api_calls");
+                if (child_api > 0) {
+                    out.print(" {s}· {d} api · {d} in ({d} cached) + {d} out{s}", .{
+                        style.dim,
+                        child_api,
+                        S.usageInt(c, "input_tokens") + S.usageInt(c, "cache_read_input_tokens"),
+                        S.usageInt(c, "cache_read_input_tokens"),
+                        S.usageInt(c, "output_tokens"),
+                        style.reset,
+                    }) catch {};
+                    const usd = S.usageFloat(c, "cost_usd");
+                    if (usd > 0)
+                        out.print(" {s}· ${d:.4}{s}", .{ style.green, usd, style.reset }) catch {}
+                    else if (S.usageInt(c, "subscription_calls") > 0)
+                        out.print(" {s}· sub{s}", .{ style.cyan, style.reset }) catch {}
+                    else if (S.usageInt(c, "unpriced_calls") > 0)
+                        out.print(" {s}· unpriced{s}", .{ style.yellow, style.reset }) catch {};
+                }
                 out.writeAll("\n") catch {};
             }
         }
@@ -5563,6 +5924,31 @@ fn handleCommand(root: *Agent, keys: *Keys, arena: Allocator, line: []const u8, 
             if (root.fast) "on" else "off",
             if (root.provider.kind != .responses) " (codex only — current model ignores it)" else "",
         });
+        try out.flush();
+        return;
+    }
+    if (std.mem.eql(u8, line, "/ultracode") or std.mem.eql(u8, line, "/ultracode on") or std.mem.eql(u8, line, "/ultracode off")) {
+        root.ultracode_mode = if (std.mem.eql(u8, line, "/ultracode on")) true else if (std.mem.eql(u8, line, "/ultracode off")) false else !root.ultracode_mode;
+        if (root.ultracode_mode) {
+            ultracodeShine(out, root.io);
+            try out.print(
+                "{s}╭─ ⚡ ultracode mode{s}\n" ++
+                    "{s}│{s} persistent multi-agent orchestration is {s}ON{s} for this chat\n" ++
+                    "{s}│{s} ordinary prompts now get the workflow/subagent boost; the prompt badge shows {s}⚡ ultra{s}\n" ++
+                    "{s}╰─{s} toggle back with {s}/ultracode off{s}\n",
+                .{
+                    style.cyan,  style.reset,
+                    style.cyan,  style.reset,
+                    style.green, style.reset,
+                    style.cyan,  style.reset,
+                    style.cyan,  style.reset,
+                    style.cyan,  style.reset,
+                    style.dim,   style.reset,
+                },
+            );
+        } else {
+            try out.print("{s}○ ultracode mode off{s} — ordinary prompts no longer auto-orchestrate (the codeword still works per prompt)\n", .{ style.dim, style.reset });
+        }
         try out.flush();
         return;
     }
@@ -6030,12 +6416,13 @@ fn handleCommand(root: *Agent, keys: *Keys, arena: Allocator, line: []const u8, 
         \\  /effort         thinking depth: low|medium|high (codex, deepseek, codegraff; default medium, persists)
         \\  /reasoning      alias for /effort
         \\  /fast           codex only: priority service tier for lower latency (toggle, persists)
+        \\  /ultracode      toggle persistent multi-agent workflow mode for this chat
         \\  /strict         toggle "every message is a tool" mode
         \\  /yolo           toggle bash auto-approval (skip permission prompts)
         \\  /trace          toggle the JSONL event trace (harness.trace.jsonl)
-        \\  /trajectory     show this session's agent tree — turns + spawned
+        \\  /trajectory     show this session's agent tree + token/cost totals
         \\                  subagents with system-prompt fingerprints
-        \\                  (harness.trajectory.jsonl, DGM-style)
+        \\                  (harness.trajectory.jsonl, DGM/Claude-style JSONL)
         \\  /agents         list agent types — builtin personas + .harness/agents/*.md
         \\                  (spawn with subagent agent:"<name>")
         \\  /compact        summarize history into a fresh context
@@ -6053,8 +6440,8 @@ fn handleCommand(root: *Agent, keys: *Keys, arena: Allocator, line: []const u8, 
         \\
         \\esc during a response interrupts the turn (what streamed stays in history).
         \\"always allow" answers persist to .harness/settings.json in the cwd.
-        \\codeword: include "ultracode" in any message to force a multi-agent
-        \\workflow turn (phases of parallel subagents, then synthesis).
+        \\codeword: include "ultracode" in any message to force one multi-agent
+        \\workflow turn; /ultracode toggles that behavior persistently for this chat.
         \\
         \\launch flags: --model <name> · --yolo (skip prompts) · -p "prompt" (one-shot) · --system-prompt/--append-system-prompt · --timing · --cost · --json (SDK protocol) · --help · --version
         \\subcommands: `graff login [codex]` (OAuth) · `graff key set <provider> <key>` (Keychain) · `graff --schema`
@@ -7177,6 +7564,9 @@ fn saveSession(root: *Agent, arena: Allocator, name: []const u8) !void {
     try s.write(root.provider.model);
     try s.objectField("strict");
     try s.write(root.strict);
+    try s.objectField("ultracode_mode");
+    try s.write(root.ultracode_mode);
+    if (root.provider.kind == .responses) try normalizeResponsesHistory(arena, &root.messages);
     try s.objectField("messages");
     try s.write(Value{ .array = root.messages });
     try s.endObject();
@@ -7198,10 +7588,13 @@ fn loadSession(root: *Agent, keys: Keys, arena: Allocator, name: []const u8) !vo
     const model = if (obj.get("model")) |v| v.string else return error.BadSession;
     const msgs = if (obj.get("messages")) |v| (if (v == .array) v.array else return error.BadSession) else return error.BadSession;
     const strict = if (obj.get("strict")) |v| (v == .bool and v.bool) else false;
+    const ultracode_mode = if (obj.get("ultracode_mode")) |v| (v == .bool and v.bool) else false;
 
     root.provider = try keys.providerById(pid, model);
     root.messages = msgs;
+    if (root.provider.kind == .responses) try normalizeResponsesHistory(arena, &root.messages);
     root.strict = strict;
+    root.ultracode_mode = ultracode_mode;
     root.last_context_tokens = 0;
     root.cap_new = false; // per-provider; relearn on rejection
     root.effort_rejected = false;
@@ -7271,6 +7664,7 @@ const Agent = struct {
     approvals: ?*Approvals = null, // shared bash-approval state, set by main()
     tracer: ?*Tracer = null, // shared JSONL event trace, set by main()
     last_cache_read: u64 = 0, // KV-cache read tokens from the latest response
+    usage: UsageTally = .{}, // API token/cost counters for this agent/run
     sys_normal: []const u8 = main_system_prompt, // root system prompt (+ project instructions)
     sys_override: ?[]const u8 = null, // subagent-only: per-child system prompt (swarm prompt variants)
     tools_used: ToolSink = .{}, // external tool calls this agent made (per turn for the root)
@@ -7290,6 +7684,7 @@ const Agent = struct {
     keep_context: bool = true, // carry the conversation across wire-format model switches (/keepcontext)
     reasoning: ReasoningEffort = .medium, // reasoning/thinking depth — codex, deepseek, codegraff (/effort, /reasoning)
     fast: bool = false, // codex "fast" mode → priority service_tier (/fast)
+    ultracode_mode: bool = false, // persistent ultracode (multi-agent workflow) mode (/ultracode)
     sys_strict: []const u8 = main_system_prompt_strict,
     tools_anthropic: []const u8 = tools_anthropic_sub,
     tools_openai: []const u8 = tools_openai_sub,
@@ -7309,6 +7704,7 @@ const Agent = struct {
     arg_live: ArgLive = .{}, // live attempt_completion/ask_user argument text
     streamed_args: ArgTool = .none, // which meta tool's prose streamed live this request
     streamed_args_len: usize = 0, // raw bytes emitted for it (gates re-print suppression)
+    last_prompt_cols: usize = 0, // visible columns occupied by prompt prefix; fallback when DSR fails
     cap_new: bool = false, // provider rejected max_tokens → use max_completion_tokens
     effort_rejected: bool = false, // model rejected reasoning_effort → drop it (e.g. gpt-5.5 on chat/completions wants /v1/responses)
     next_ask_id: u64 = 1,
@@ -7316,7 +7712,22 @@ const Agent = struct {
     fn prompt(self: *Agent) !void {
         if (json_mode) return; // SDK drives turns; no human prompt
         const w = self.out orelse return;
-        const flag: []const u8 = if (self.strict and plan_mode) " strict·plan" else if (self.strict) " strict" else if (plan_mode) " plan" else "";
+        const flag: []const u8 = if (self.ultracode_mode and self.strict and plan_mode)
+            " ⚡ ultra·strict·plan"
+        else if (self.ultracode_mode and self.strict)
+            " ⚡ ultra·strict"
+        else if (self.ultracode_mode and plan_mode)
+            " ⚡ ultra·plan"
+        else if (self.ultracode_mode)
+            " ⚡ ultra"
+        else if (self.strict and plan_mode)
+            " strict·plan"
+        else if (self.strict)
+            " strict"
+        else if (plan_mode)
+            " plan"
+        else
+            "";
         var cbuf: [40]u8 = undefined;
         const cost: []const u8 = if (!show_cost) "" else blk: {
             if (std.mem.eql(u8, self.provider.id, "codex"))
@@ -7334,13 +7745,21 @@ const Agent = struct {
             const threshold = self.provider.compactAt();
             // % of the compaction budget already used — glanceable headroom.
             const pct = if (threshold > 0) self.last_context_tokens * 100 / threshold else 0;
-            try w.print("\n{s}[{s}{s}{s}{s}{s} · {d}/{d}k tok ({d}%){s}{s}]{s} {s}›{s} ", .{
+            var pbuf: [512]u8 = undefined;
+            const plain = std.fmt.bufPrint(&pbuf, "[{s}{s} · {d}/{d}k tok ({d}%){s}{s}] › ", .{
+                self.provider.model, flag, self.last_context_tokens, threshold / 1000, pct, cached, cost,
+            }) catch "";
+            self.last_prompt_cols = codepointCount(plain);
+            try w.print("\r\n{s}[{s}{s}{s}{s}{s} · {d}/{d}k tok ({d}%){s}{s}]{s} {s}›{s} ", .{
                 style.dim,                style.reset,      style.cyan, self.provider.model, flag, style.dim,
                 self.last_context_tokens, threshold / 1000, pct,        cached,              cost, style.reset,
                 style.bold,               style.reset,
             });
         } else {
-            try w.print("\n{s}[{s}{s}{s}{s}{s}{s}]{s} {s}›{s} ", .{
+            var pbuf: [512]u8 = undefined;
+            const plain = std.fmt.bufPrint(&pbuf, "[{s}{s}{s}] › ", .{ self.provider.model, flag, cost }) catch "";
+            self.last_prompt_cols = codepointCount(plain);
+            try w.print("\r\n{s}[{s}{s}{s}{s}{s}{s}]{s} {s}›{s} ", .{
                 style.dim,   style.reset, style.cyan,  self.provider.model, flag, style.dim, cost,
                 style.reset, style.bold,  style.reset,
             });
@@ -7617,6 +8036,7 @@ const Agent = struct {
     /// price_table row. Subscription providers (codex, claude) bill flat
     /// and tally as sub_calls; unpriced models as unpriced_calls.
     fn recordCost(self: *Agent, uncached_in: i64, cache_in: i64, out: i64) void {
+        self.usage.add(self.provider.id, self.provider.model, uncached_in, cache_in, out);
         g_cost.add(self.io, self.provider.id, self.provider.model, uncached_in, cache_in, out);
     }
 
@@ -8401,6 +8821,7 @@ const Agent = struct {
                 // returned encrypted and passed back for cross-turn continuity.
                 try s.objectField("instructions");
                 try s.write(self.systemPrompt());
+                try normalizeResponsesHistory(self.arena, &self.messages);
                 try s.objectField("input");
                 try s.write(Value{ .array = self.messages });
                 if (tools) |t| {
@@ -10123,6 +10544,34 @@ fn toolResultMessage(arena: Allocator, kind: Provider.Kind, call_id: []const u8,
     return .{ .object = obj };
 }
 
+/// Older builds accidentally serialized a `[]u8` tool result into Responses
+/// history as `"output":[104,101,...]` instead of `"output":"he..."`. If that
+/// malformed item is already in an autosaved/resumed session, every future Codex
+/// request fails with `input[N].output[0]: expected an object, got an integer`.
+/// Repair those legacy byte arrays in-place before sending or saving history.
+fn normalizeResponsesHistory(arena: Allocator, messages: *std.json.Array) !void {
+    for (messages.items) |*msg| {
+        if (msg.* != .object) continue;
+        const typ = msg.object.get("type") orelse continue;
+        if (typ != .string or !std.mem.eql(u8, typ.string, "function_call_output")) continue;
+        const output = msg.object.get("output") orelse continue;
+        if (output == .string) continue;
+        if (output != .array) continue;
+
+        const bytes = try byteArrayToString(arena, output.array);
+        try msg.object.put(arena, "output", .{ .string = bytes });
+    }
+}
+
+fn byteArrayToString(arena: Allocator, array: std.json.Array) ![]const u8 {
+    const bytes = try arena.alloc(u8, array.items.len);
+    for (array.items, bytes) |item, *byte| {
+        if (item != .integer or item.integer < 0 or item.integer > 255) return error.BadResponsesOutput;
+        byte.* = @intCast(item.integer);
+    }
+    return bytes;
+}
+
 /// A base64-encoded image staged by `/image`, sent with the next user turn.
 const PendingImage = struct { media_type: []const u8, b64: []const u8, label: []const u8 };
 
@@ -11448,6 +11897,7 @@ fn runSub(ctx: ToolCtx, kind: []const u8, label: []const u8, prompt: []const u8,
             .tools = tools,
             .ok = run_ok,
             .context_tokens = agent.last_context_tokens,
+            .usage = agent.usage,
         });
     }
     if (g_telem) |t| t.runEvent(&fp, sys_override != null, run_ok, run_ms, tools);
@@ -12004,6 +12454,29 @@ test "parseDsrCol: well-formed and malformed replies" {
     try std.testing.expectEqual(@as(?usize, null), parseDsrCol(""));
 }
 
+test "promptFallbackCol wraps prompt width like a terminal DSR column" {
+    try std.testing.expectEqual(@as(usize, 1), promptFallbackCol(0, 80));
+    try std.testing.expectEqual(@as(usize, 11), promptFallbackCol(10, 80));
+    // A long model/context badge may wrap before DSR replies; fallback must use
+    // the physical column on the current row, not the total prompt width + 1.
+    try std.testing.expectEqual(@as(usize, 21), promptFallbackCol(100, 80));
+    // Exact right-edge prompts have no column after the prompt on that row.
+    try std.testing.expectEqual(@as(usize, 81), promptFallbackCol(80, 80));
+    try std.testing.expectEqual(@as(usize, 1), promptFallbackCol(0, 0));
+}
+
+test "promptDsrColOrFallback rejects stale naked-line columns" {
+    const fallback = promptFallbackCol(18, 80);
+    try std.testing.expectEqual(@as(usize, fallback), promptDsrColOrFallback(null, fallback, 80));
+    try std.testing.expectEqual(@as(usize, fallback), promptDsrColOrFallback(1, fallback, 80));
+    try std.testing.expectEqual(@as(usize, fallback), promptDsrColOrFallback(3, fallback, 80));
+    try std.testing.expectEqual(@as(usize, 20), promptDsrColOrFallback(20, fallback, 80));
+
+    const edge_fallback = promptFallbackCol(80, 80);
+    try std.testing.expectEqual(@as(usize, edge_fallback), promptDsrColOrFallback(80, edge_fallback, 80));
+    try std.testing.expectEqual(@as(usize, edge_fallback), promptDsrColOrFallback(1, edge_fallback, 80));
+}
+
 test "scoreSigMessage: canonical bytes are cross-language stable" {
     // The Python SDK (score_signature) and the telemetry worker recompute
     // this byte-for-byte; {d:.6} drifting would silently break every sig.
@@ -12146,6 +12619,27 @@ test "usdFor: per-million math and negative clamping" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.5), usdFor(p, 0, 1_000_000, 0), 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 3.0), usdFor(p, 0, 0, 100_000), 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 0.0), usdFor(p, -42, -1, 0), 1e-9); // clamped
+}
+
+test "UsageTally records token deltas and priced/subscription billing" {
+    var total: UsageTally = .{};
+    total.add("openai", "gpt-5.5", 1000, 200, 300);
+    const before = total;
+    total.add("codex", "gpt-5.5", 10, 0, 20);
+    const delta = total.diff(before);
+
+    try std.testing.expectEqual(@as(u64, 1010), total.input_tokens);
+    try std.testing.expectEqual(@as(u64, 200), total.cache_read_input_tokens);
+    try std.testing.expectEqual(@as(u64, 320), total.output_tokens);
+    try std.testing.expectEqual(@as(u64, 2), total.api_calls);
+    try std.testing.expectEqual(@as(u64, 1), total.subscription_calls);
+    try std.testing.expectApproxEqAbs(usdFor(priceFor("gpt-5.5").?, 1000, 200, 300), total.cost_usd, 1e-12);
+
+    try std.testing.expectEqual(@as(u64, 10), delta.input_tokens);
+    try std.testing.expectEqual(@as(u64, 20), delta.output_tokens);
+    try std.testing.expectEqual(@as(u64, 1), delta.api_calls);
+    try std.testing.expectEqual(@as(u64, 1), delta.subscription_calls);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), delta.cost_usd, 1e-12);
 }
 
 test "mcpServerConnected: prefix match on qualified names" {
@@ -12325,6 +12819,36 @@ test "toolResultMessage: result text serializes as a JSON string in every wire f
         const json = try enc(arena, err);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"content\":\"nope\"") != null);
     }
+}
+
+test "normalizeResponsesHistory repairs legacy byte-array function_call_output" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var output = std.json.Array.init(arena);
+    try output.append(.{ .integer = 'h' });
+    try output.append(.{ .integer = 'i' });
+
+    var bad: std.json.ObjectMap = .empty;
+    try bad.put(arena, "type", .{ .string = "function_call_output" });
+    try bad.put(arena, "call_id", .{ .string = "call_legacy" });
+    try bad.put(arena, "output", .{ .array = output });
+
+    var messages = std.json.Array.init(arena);
+    try messages.append(.{ .object = bad });
+
+    try normalizeResponsesHistory(arena, &messages);
+    const msg = messages.items[0].object;
+    try std.testing.expect(msg.get("output").? == .string);
+    try std.testing.expectEqualStrings("hi", msg.get("output").?.string);
+
+    var aw: Io.Writer.Allocating = .init(arena);
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+    try s.write(Value{ .array = messages });
+    const json = try aw.toOwnedSlice();
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"output\":\"hi\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"output\":[") == null);
 }
 
 test "Approvals.isSimple: rejects shell metacharacters that could smuggle a second command" {

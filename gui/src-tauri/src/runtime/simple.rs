@@ -27,6 +27,7 @@ struct ConversationState {
     active_request_ids: Vec<String>,
     active_agent_id: Option<String>,
     plan_mode: bool,
+    ultracode_enabled: bool,
     goal: Option<String>,
     updated_at: i64,
 }
@@ -427,6 +428,11 @@ impl RuntimeManager {
             command("agent", "Show active agent.", false),
             command("goal", "Set/show the current objective.", true),
             command("loop", "Run an autonomous plan→act→verify pass.", true),
+            command(
+                "ultracode",
+                "Toggle persistent multi-agent workflow mode for this chat.",
+                true,
+            ),
             command("compact", "Compact current conversation.", true),
             command("workspace-status", "Show git status.", true),
         ])
@@ -465,6 +471,7 @@ impl RuntimeManager {
                     active_request_ids: vec![],
                     active_agent_id,
                     plan_mode,
+                    ultracode_enabled: false,
                     goal: None,
                     updated_at: now_millis(),
                 });
@@ -908,7 +915,9 @@ impl RuntimeManager {
                 continue;
             };
             match event.get("type").and_then(serde_json::Value::as_str) {
-                Some("model" | "compact" | "mode" | "agent" | "effort" | "fast") => break event,
+                Some("model" | "compact" | "mode" | "agent" | "effort" | "fast" | "ultracode") => {
+                    break event;
+                }
                 Some("error") => {
                     let message = event
                         .get("message")
@@ -948,6 +957,7 @@ impl RuntimeManager {
                     messages: conversation.messages.clone(),
                     active_agent_id: conversation.active_agent_id.clone(),
                     plan_mode: conversation.plan_mode,
+                    ultracode_enabled: conversation.ultracode_enabled,
                     goal: conversation.goal.clone(),
                     updated_at: conversation.updated_at,
                 })
@@ -986,7 +996,7 @@ impl RuntimeManager {
         let model_arg = self.selected_model_name().await;
         let mut sessions = self.sessions.lock().await;
         if !sessions.contains_key(conversation_id) {
-            let (active_agent_id, plan_mode, effort, fast) = {
+            let (active_agent_id, plan_mode, ultracode_enabled, effort, fast) = {
                 let state = self.state.lock().await;
                 let conversation = state.conversations.get(conversation_id);
                 (
@@ -995,6 +1005,9 @@ impl RuntimeManager {
                         .or_else(|| state.active_agent_id.clone()),
                     conversation
                         .map(|conversation| conversation.plan_mode)
+                        .unwrap_or(false),
+                    conversation
+                        .map(|conversation| conversation.ultracode_enabled)
                         .unwrap_or(false),
                     state.selected_effort.clone(),
                     state.fast_enabled,
@@ -1014,6 +1027,13 @@ impl RuntimeManager {
                 self.send_control(
                     conversation_id,
                     serde_json::json!({ "type": "set_mode", "mode": "plan" }),
+                )
+                .await?;
+            }
+            if ultracode_enabled {
+                self.send_control(
+                    conversation_id,
+                    serde_json::json!({ "type": "set_ultracode", "on": true }),
                 )
                 .await?;
             }
@@ -1170,6 +1190,47 @@ impl RuntimeManager {
                     payload: None,
                 })
             }
+            "ultracode" => {
+                let conversation_id = conversation_id.context("Missing conversation")?;
+                let now_on = {
+                    let mut state = self.state.lock().await;
+                    let conversation = state
+                        .conversations
+                        .get_mut(&conversation_id)
+                        .context("Conversation not found")?;
+                    let requested = args.first().map(|arg| arg.to_ascii_lowercase());
+                    conversation.ultracode_enabled = match requested.as_deref() {
+                        Some("on") => true,
+                        Some("off") => false,
+                        _ => !conversation.ultracode_enabled,
+                    };
+                    conversation.updated_at = now_millis();
+                    conversation.ultracode_enabled
+                };
+                self.persist_conversations().await;
+                if self.session_exists(&conversation_id).await {
+                    self.send_control(
+                        &conversation_id,
+                        serde_json::json!({ "type": "set_ultracode", "on": now_on }),
+                    )
+                    .await?;
+                }
+                let body = if now_on {
+                    "Ultracode mode enabled for this chat."
+                } else {
+                    "Ultracode mode disabled for this chat."
+                };
+                let snapshot = self.snapshot().await?;
+                let _ = self.emitter.emit_session_updated(snapshot.clone());
+                Ok(CommandRunResultDto {
+                    title: "/ultracode".into(),
+                    body: Some(body.into()),
+                    snapshot: Some(snapshot),
+                    saved_path: None,
+                    result_kind: CommandResultKindDto::Text,
+                    payload: None,
+                })
+            }
             "compact" => Ok(CommandRunResultDto {
                 title: "/compact".into(),
                 body: None,
@@ -1203,7 +1264,7 @@ impl RuntimeManager {
             _ => Ok(CommandRunResultDto {
                 title: format!("/{name}"),
                 body: Some(format!(
-                    "Available MVP commands: /help, /agent, /goal, /loop, /compact, /workspace-status. Args: {}",
+                    "Available MVP commands: /help, /agent, /goal, /loop, /ultracode, /compact, /workspace-status. Args: {}",
                     args.join(" ")
                 )),
                 snapshot: None,
@@ -1542,6 +1603,7 @@ impl RuntimeManager {
                 active_request_ids: vec![],
                 active_agent_id: None,
                 plan_mode: false,
+                ultracode_enabled: false,
                 goal: None,
                 updated_at: now_millis(),
             },
@@ -2088,6 +2150,8 @@ struct PersistedConversation {
     #[serde(default)]
     plan_mode: bool,
     #[serde(default)]
+    ultracode_enabled: bool,
+    #[serde(default)]
     goal: Option<String>,
     #[serde(default)]
     updated_at: i64,
@@ -2173,6 +2237,7 @@ fn load_persisted_conversations() -> HashMap<String, ConversationState> {
                     active_request_ids: vec![],
                     active_agent_id: conversation.active_agent_id,
                     plan_mode: conversation.plan_mode,
+                    ultracode_enabled: conversation.ultracode_enabled,
                     goal: conversation.goal,
                     updated_at: conversation.updated_at,
                 },
@@ -2287,10 +2352,43 @@ fn command(name: &str, usage: &str, requires_workspace: bool) -> CommandDescript
         is_agent_switch: false,
         execution_kind: CommandExecutionKindDto::Runnable,
         requires_workspace,
-        requires_conversation: matches!(name, "compact" | "goal" | "loop"),
+        requires_conversation: matches!(name, "compact" | "goal" | "loop" | "ultracode"),
         argument_hint: None,
         result_kind: CommandResultKindDto::Text,
     }
+}
+
+/// macOS GUI processes launched from Finder/Dock get launchd's minimal
+/// environment, not the user's shell — so `export OPENAI_API_KEY=…` (and any
+/// other `*_API_KEY`) from .zshrc/.zprofile is invisible to children we spawn.
+/// Capture the login shell's environment once (best-effort, time-bounded) so a
+/// GUI-spawned `graff` sees the same provider keys the terminal `graff` does.
+fn login_shell_env() -> &'static std::collections::HashMap<String, String> {
+    static ENV: std::sync::OnceLock<std::collections::HashMap<String, String>> =
+        std::sync::OnceLock::new();
+    ENV.get_or_init(|| {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // -il = interactive login shell: sources the login profile AND
+            // .zshrc/.bashrc, where most users export their *_API_KEY.
+            let out = std::process::Command::new(&shell)
+                .args(["-ilc", "env"])
+                .output();
+            let _ = tx.send(out);
+        });
+        let mut map = std::collections::HashMap::new();
+        if let Ok(Ok(out)) = rx.recv_timeout(std::time::Duration::from_secs(4)) {
+            if out.status.success() {
+                for line in String::from_utf8_lossy(&out.stdout).lines() {
+                    if let Some((k, v)) = line.split_once('=') {
+                        map.insert(k.to_string(), v.to_string());
+                    }
+                }
+            }
+        }
+        map
+    })
 }
 
 /// Spawns a persistent `graff --json` child for a conversation. `--yolo` skips
@@ -2303,6 +2401,12 @@ fn spawn_graff_session(workspace_path: &str, model: Option<&str>) -> Result<Graf
     if let Some(model) = model.filter(|model| !model.is_empty() && *model != "default") {
         command.arg("--model").arg(model);
     }
+    // macOS GUI apps (Finder/Dock) inherit launchd's minimal env, not the user's
+    // shell — so OPENAI_API_KEY & co. exported in .zshrc are invisible to graff,
+    // which then silently falls back to a file-based login (e.g. an empty
+    // codegraff account). Pass the login shell's env so the GUI sees the same
+    // provider keys the terminal does.
+    command.envs(login_shell_env());
     let mut child = command
         .current_dir(workspace_path)
         .stdin(std::process::Stdio::piped())
@@ -2804,24 +2908,54 @@ fn followup_answer_line(request: &FollowupRequestDto, response: &FollowupRespons
 /// `current_dir` set to the workspace, and a relative program path would be
 /// resolved against that workspace (not the repo) — so a relative override like
 /// `CODEGRAFF_GUI_BINARY=../zig-out/bin/graff` must be canonicalized here.
+/// True only for a real, non-empty, executable file. A path that exists but is
+/// empty or not executable (e.g. an `externalBin` sidecar copy a `cargo build`
+/// left half-written, or a clobbered 0-byte binary) must NOT be returned as the
+/// engine path — a bare `is_file()` check would hand it back and shadow the
+/// working fallbacks below, and the spawn then dies with EACCES on exec.
+fn is_usable_binary(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 fn codegraff_binary() -> String {
-    // 1. Explicit override, canonicalized to absolute when it resolves to a file.
+    // 1. Explicit override, canonicalized to absolute when it resolves to a
+    //    usable file. A broken override falls through to the built-in rather
+    //    than failing the launch outright.
     if let Some(value) = std::env::var("CODEGRAFF_GUI_BINARY")
         .ok()
         .filter(|value| !value.trim().is_empty())
     {
         if let Ok(absolute) = std::fs::canonicalize(&value) {
-            return absolute.to_string_lossy().into_owned();
+            if is_usable_binary(&absolute) {
+                return absolute.to_string_lossy().into_owned();
+            }
         }
-        // Doesn't resolve from the current dir — fall through to the built-in.
+        // Doesn't resolve to a usable file — fall through to the built-in.
     }
     // 2. Bundled sidecar: Tauri's externalBin lands next to the app executable
     //    (Contents/MacOS/graff on macOS), so a packaged .app is self-contained —
     //    no separate CLI install needed. This is what fixes GUI-only users.
+    //    Guard on is_usable_binary: an interrupted `cargo build` can leave a
+    //    0-byte sidecar here, and a bare is_file() check would return it and
+    //    shadow the working binaries below (the EACCES-at-exec failure).
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let p = dir.join("graff");
-            if p.is_file() {
+            if is_usable_binary(&p) {
                 return p.to_string_lossy().into_owned();
             }
         }
@@ -2829,7 +2963,9 @@ fn codegraff_binary() -> String {
     // 3. Dev build: <crate>/../../zig-out/bin/graff (only exists on a dev machine).
     let candidate = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../zig-out/bin/graff");
     if let Ok(absolute) = std::fs::canonicalize(&candidate) {
-        return absolute.to_string_lossy().into_owned();
+        if is_usable_binary(&absolute) {
+            return absolute.to_string_lossy().into_owned();
+        }
     }
     // 4. Known install locations. A Finder/Dock-launched .app inherits launchd's
     //    minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin), which excludes ~/bin,
@@ -2840,7 +2976,7 @@ fn codegraff_binary() -> String {
     if let Ok(home) = std::env::var("HOME") {
         for rel in ["bin/graff", ".local/bin/graff"] {
             let p = Path::new(&home).join(rel);
-            if p.is_file() {
+            if is_usable_binary(&p) {
                 return p.to_string_lossy().into_owned();
             }
         }
@@ -2850,7 +2986,7 @@ fn codegraff_binary() -> String {
         "/usr/local/bin/graff",
         "/usr/bin/graff",
     ] {
-        if Path::new(abs).is_file() {
+        if is_usable_binary(Path::new(abs)) {
             return abs.to_string();
         }
     }
@@ -3139,8 +3275,7 @@ fn provider_login_configured(
         }
         "codex" => home_codex_auth_has_valid_token(home),
         "kimi" => {
-            key_list_mentions_provider(key_list, &provider.id)
-                || kimi_auth_has_valid_token(home)
+            key_list_mentions_provider(key_list, &provider.id) || kimi_auth_has_valid_token(home)
         }
         _ => key_list_mentions_provider(key_list, &provider.id),
     }
@@ -3584,6 +3719,7 @@ mod tests {
                 active_request_ids: vec![],
                 active_agent_id: None,
                 plan_mode: false,
+                ultracode_enabled: false,
                 goal: None,
                 updated_at: 10,
             },
@@ -3842,6 +3978,7 @@ mod tests {
                 active_request_ids: vec![],
                 active_agent_id: None,
                 plan_mode: false,
+                ultracode_enabled: false,
                 goal: None,
                 updated_at: 10,
             },
@@ -3856,6 +3993,7 @@ mod tests {
                 active_request_ids: vec![],
                 active_agent_id: None,
                 plan_mode: false,
+                ultracode_enabled: false,
                 goal: None,
                 updated_at: 20,
             },

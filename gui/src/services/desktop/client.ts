@@ -74,6 +74,7 @@ const qaCommandRows: Array<[
   ["reasoning-effort", "Update reasoning effort.", "<low|medium|high>", "text"],
   ["goal", "Set/show the current objective.", "<objective|clear>", "text"],
   ["loop", "Run an autonomous plan→act→verify pass.", "<prompt>", "snapshot"],
+  ["ultracode", "Toggle persistent multi-agent workflow mode for this chat.", "[on|off]", "text"],
   ["workspace-info", "Show indexed workspace metadata.", null, "workspaceInfo"],
   ["workspace-status", "Show workspace file status.", null, "workspaceStatus"],
   ["workspace-query", "Search the workspace semantically.", "<query>", "workspaceSearch"],
@@ -242,6 +243,8 @@ function qaCommandResult(input: {
       return { body: input.args.length > 0 ? `Goal set: **${input.args.join(" ")}**.` : "No active goal. Set one with `/goal <objective>`.", payload: null, resultKind: "text", savedPath: null, snapshot: null, title };
     case "loop":
       return { body: "Started an autonomous plan→act→verify pass.", payload: null, resultKind: "snapshot", savedPath: null, snapshot: createQaSnapshot(input.conversationId ?? QA_CONVERSATION_ID, [{ id: "qa-loop-user", kind: "user", requestId: "qa-loop-request", text: `/loop ${input.args.join(" ")}` }, { id: "qa-loop-assistant", kind: "assistant", requestId: "qa-loop-request", text: "Loop pass complete: planned, acted, and verified the requested change." }]), title };
+    case "ultracode":
+      return { body: "Ultracode mode enabled for this chat.", payload: null, resultKind: "text", savedPath: null, snapshot: null, title };
     case "workspace-info":
       return { body: "| Field | Value |\n|---|---|\n| Workspace | Codegraff GUI |\n| Branch | qa/mock-browser |\n| Indexed nodes | 1,284 |", payload: { createdAt: "2026-06-03T00:00:00Z", kind: "workspaceInfo", lastUpdated: "2026-06-03T12:00:00Z", nodeCount: 1284n, relationCount: 642n, workingDir: QA_WORKSPACE_PATH, workspaceId: "qa-codegraff-gui", workspacePath: QA_WORKSPACE_PATH }, resultKind: "workspaceInfo", savedPath: null, snapshot: null, title };
     case "workspace-status":

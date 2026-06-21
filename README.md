@@ -177,7 +177,8 @@ and points at the one-line install; everything else keeps working without it.
 graff doesn't just run an agent — it records every run as a node in a
 **Darwin Gödel Machine-style archive tree** ([arXiv:2505.22954](https://arxiv.org/abs/2505.22954)),
 so the harness itself is the substrate for agent self-improvement. Each session
-appends to `harness.trajectory.jsonl` (truncated per session, like the trace):
+appends to `harness.trajectory.jsonl` (Claude Code-style JSONL, but as a
+lineage tree):
 
 - **A lineage tree, not a flat log.** Root turns form a spine (each turn's
   parent is the previous one); every subagent and workflow task hangs off the
@@ -199,9 +200,11 @@ appends to `harness.trajectory.jsonl` (truncated per session, like the trace):
   outside the cwd that the evolving agent's confined tools can't reach). Readers
   recompute the HMAC and reject unsigned or forged rows. Signing is opt-in and
   backward-compatible (no key → unsigned, accepted as before).
-- **Tool-use is mined too.** Each agent logs its tool calls (name + error flag,
-  in order) — the process signal behind "which tool combinations work",
-  joinable to scores via `prompt_sha`.
+- **Tool-use + usage are mined too.** Each agent logs its tool calls (name +
+  error flag, in order) plus a `usage` object with API calls, input/cache/output
+  tokens, subscription/unpriced call counts, and estimated `cost_usd` — the same
+  practical accounting Claude Code's trajectories enable, but attached to every
+  turn/subagent node and joinable to scores via `prompt_sha`.
 - **Closed loop in releases.** Release binaries ship anonymous evolution
   telemetry (opt-out) so agent-variant fitness is learned across the fleet, not
   just one laptop. `/trajectory` renders the current session's agent tree; see
@@ -337,6 +340,7 @@ clears the input line.
 /strict         toggle "every message is a tool" mode
 /yolo           toggle bash auto-approval (skip permission prompts)
 /trace          toggle the JSONL event trace (harness.trace.jsonl)
+/trajectory     show agent tree + token/cost totals (harness.trajectory.jsonl)
 /compact        summarize history into a fresh context
 /save | /resume | /sessions   session persistence; bare /resume → interactive picker
 /todo           show the current task list
