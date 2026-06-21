@@ -75,6 +75,7 @@ function createSnapshot(
         messages: [],
         requestAgentIds: {},
         todos: [],
+        ultracodeEnabled: false,
         workspacePath,
       },
     ],
@@ -83,6 +84,7 @@ function createSnapshot(
     visibleActiveRequestIds: [],
     visibleFollowup: null,
     visibleMessages: [],
+    visibleUltracodeEnabled: false,
     visibleRequestAgentIds: {},
     visibleTodos: [],
     workspaces: [
@@ -254,6 +256,7 @@ describe("SessionProvider", () => {
                     messages: [],
                     requestAgentIds: {},
                     todos: [],
+                    ultracodeEnabled: false,
                     workspacePath:
                       input.target === "worktree"
                         ? "/workspace/codegraff-gui-worktree"
@@ -887,6 +890,7 @@ describe("SessionProvider", () => {
             ],
             requestAgentIds: { "req-plan-1": "muse" },
             todos: [],
+            ultracodeEnabled: false,
             workspacePath: input.workspacePath,
           },
         ],
@@ -1010,6 +1014,7 @@ describe("SessionProvider", () => {
             ],
             requestAgentIds: { "req-plan-complete": "muse" },
             todos: [],
+            ultracodeEnabled: false,
             workspacePath: input.workspacePath,
           },
         ],

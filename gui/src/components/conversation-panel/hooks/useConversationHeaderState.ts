@@ -39,8 +39,13 @@ export function useConversationHeaderState(binding?: ChatBinding | null) {
     React.useState<PendingHeaderAction | null>(null);
   const branchSearchInputRef = React.useRef<HTMLInputElement | null>(null);
 
-  const { activeWorkspaceLabel, runtimeStatus, workspaceKind, workspacePath } =
-    useConversationSession(binding);
+  const {
+    activeWorkspaceLabel,
+    isUltracodeMode,
+    runtimeStatus,
+    workspaceKind,
+    workspacePath,
+  } = useConversationSession(binding);
   const conversationSummary = useConversationSummary(binding);
   const {
     checkoutBranch,
@@ -339,6 +344,7 @@ export function useConversationHeaderState(binding?: ChatBinding | null) {
     isHandoffPending,
     isManagedChat,
     isOpenTargetPending,
+    isUltracodeMode,
     isProjectChangePending,
     canHandoffToLocal,
     canHandoffToWorktree,

@@ -1,4 +1,4 @@
-import { ChevronRight } from "lucide-react";
+import { ChevronRight, ZapIcon } from "lucide-react";
 
 import {
   Breadcrumb,
@@ -42,6 +42,7 @@ export function ConversationPanelHeader({
     isHandoffPending,
     isManagedChat,
     isOpenTargetPending,
+    isUltracodeMode,
     isProjectChangePending,
     canHandoffToLocal,
     canHandoffToWorktree,
@@ -123,6 +124,16 @@ export function ConversationPanelHeader({
             </BreadcrumbList>
           </Breadcrumb>
         </div>
+
+        {isUltracodeMode ? (
+          <div
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-[color:color-mix(in_oklab,var(--accent)_50%,transparent)] bg-[color:color-mix(in_oklab,var(--accent)_12%,transparent)] px-2 py-0.5 text-[11px] font-semibold text-[color:var(--accent)] shadow-[0_0_18px_color-mix(in_oklab,var(--accent)_18%,transparent)]"
+            title="Ultracode mode is ON for this chat: ordinary prompts request workflow/subagent orchestration."
+          >
+            <ZapIcon className="size-3" />
+            ultra
+          </div>
+        ) : null}
 
         <div
           role="presentation"

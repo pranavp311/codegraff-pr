@@ -29,7 +29,7 @@ export type ConversationSessionSummary = { conversationId: string, title: string
 
 export type ChatBinding = { workspacePath: string, conversationId: string, };
 
-export type ConversationViewSnapshot = { workspacePath: string, conversationId: string, messages: Array<SessionMessage>, activeRequestIds: Array<string>, requestAgentIds: { [key in string]: string }, todos: Array<SessionTodo>, followup: FollowupRequest | null, };
+export type ConversationViewSnapshot = { workspacePath: string, conversationId: string, messages: Array<SessionMessage>, activeRequestIds: Array<string>, requestAgentIds: { [key in string]: string }, todos: Array<SessionTodo>, followup: FollowupRequest | null, ultracodeEnabled: boolean, };
 
 export type WorkspaceKind = "project" | "managed_chat";
 
@@ -39,7 +39,7 @@ export type SavedWorkspaceSummary = { id: string, name: string, updatedAt: bigin
 
 export type SavedWorkspaceDetail = { id: string, name: string, layoutJson: string, updatedAt: bigint, };
 
-export type SessionSnapshot = { activeWorkspacePath: string | null, activeConversationId: string | null, visibleMessages: Array<SessionMessage>, visibleActiveRequestIds: Array<string>, visibleRequestAgentIds: { [key in string]: string }, visibleTodos: Array<SessionTodo>, visibleFollowup: FollowupRequest | null, conversationViews: Array<ConversationViewSnapshot>, uiError: string | null, workspaces: Array<WorkspaceSession>, savedWorkspaces: Array<SavedWorkspaceSummary>, };
+export type SessionSnapshot = { activeWorkspacePath: string | null, activeConversationId: string | null, visibleMessages: Array<SessionMessage>, visibleActiveRequestIds: Array<string>, visibleRequestAgentIds: { [key in string]: string }, visibleTodos: Array<SessionTodo>, visibleFollowup: FollowupRequest | null, visibleUltracodeEnabled: boolean, conversationViews: Array<ConversationViewSnapshot>, uiError: string | null, workspaces: Array<WorkspaceSession>, savedWorkspaces: Array<SavedWorkspaceSummary>, };
 
 export type PromptModelOption = { providerId: string, providerName: string, modelId: string, modelName: string | null, contextLength: bigint | null, supportsReasoning: boolean, reasoningEfforts: Array<string>, };
 

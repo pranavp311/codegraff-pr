@@ -128,6 +128,8 @@ pub struct ConversationViewSnapshotDto {
     pub request_agent_ids: HashMap<String, String>,
     pub todos: Vec<SessionTodoDto>,
     pub followup: Option<super::followup::FollowupRequestDto>,
+    #[serde(default)]
+    pub ultracode_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
@@ -181,6 +183,8 @@ pub struct SessionSnapshotDto {
     pub visible_request_agent_ids: HashMap<String, String>,
     pub visible_todos: Vec<SessionTodoDto>,
     pub visible_followup: Option<super::followup::FollowupRequestDto>,
+    #[serde(default)]
+    pub visible_ultracode_enabled: bool,
     pub conversation_views: Vec<ConversationViewSnapshotDto>,
     pub ui_error: Option<String>,
     pub workspaces: Vec<WorkspaceSessionDto>,

@@ -2008,6 +2008,10 @@ impl RuntimeManager {
             visible_request_agent_ids: HashMap::new(),
             visible_todos: vec![],
             visible_followup,
+            visible_ultracode_enabled: visible
+                .as_ref()
+                .map(|c| c.ultracode_enabled)
+                .unwrap_or(false),
             conversation_views,
             ui_error: None,
             workspaces,
@@ -2339,6 +2343,7 @@ fn conversation_view(
         request_agent_ids: HashMap::new(),
         todos: vec![],
         followup,
+        ultracode_enabled: conversation.ultracode_enabled,
     }
 }
 

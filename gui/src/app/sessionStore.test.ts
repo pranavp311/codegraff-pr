@@ -63,6 +63,7 @@ function createSnapshot(
         messages: [],
         requestAgentIds: {},
         todos: [],
+        ultracodeEnabled: false,
         workspacePath: "/workspace/codegraff-gui",
       },
     ],
@@ -71,6 +72,7 @@ function createSnapshot(
     visibleActiveRequestIds: [],
     visibleFollowup: null,
     visibleMessages: [],
+    visibleUltracodeEnabled: false,
     visibleRequestAgentIds: {},
     visibleTodos: [],
     workspaces: [
@@ -381,6 +383,7 @@ describe("sessionStore", () => {
             messages: [],
             requestAgentIds: {},
             todos: [],
+            ultracodeEnabled: false,
             workspacePath: "/workspace/codegraff-gui",
           },
         ],
@@ -415,6 +418,7 @@ describe("sessionStore", () => {
       messages: [],
       requestAgentIds: {},
       todos: [],
+      ultracodeEnabled: false,
       workspacePath: "/workspace/codegraff-gui",
     });
     expect(await requestB).toEqual({
@@ -424,6 +428,7 @@ describe("sessionStore", () => {
       messages: [],
       requestAgentIds: {},
       todos: [],
+      ultracodeEnabled: false,
       workspacePath: "/workspace/codegraff-gui",
     });
   });

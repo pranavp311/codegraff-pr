@@ -34,7 +34,7 @@ export function PromptComposer({ binding, onCommandResult }: PromptComposerProps
     submitPrompt,
     updatePromptSettings,
   } = usePrompt(binding);
-  const { messages, requestAgentIds, todos } = useConversationSession(binding);
+  const { isUltracodeMode, messages, requestAgentIds, todos } = useConversationSession(binding);
   const { openProviderSettings } = useSettingsNavigation();
   const [dismissedInterruptId, setDismissedInterruptId] = useState<string | null>(
     null,
@@ -165,6 +165,7 @@ export function PromptComposer({ binding, onCommandResult }: PromptComposerProps
             isRequestActive={isRequestActive}
             isSendingPrompt={isSendingPrompt}
             isPlanningMode={isPlanningMode}
+            isUltracodeMode={isUltracodeMode}
             promptSettings={promptSettings}
             promptDraft={promptDraft}
             isInputDisabled={requiresProviderSetup}

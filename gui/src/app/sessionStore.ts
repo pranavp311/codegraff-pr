@@ -202,6 +202,7 @@ function deriveConversationViews(snapshot: SessionSnapshot) {
         messages: snapshot.visibleMessages,
         requestAgentIds: snapshot.visibleRequestAgentIds,
         todos: snapshot.visibleTodos,
+        ultracodeEnabled: snapshot.visibleUltracodeEnabled ?? false,
         workspacePath: snapshot.activeWorkspacePath,
       } satisfies ConversationViewSnapshot,
     ];

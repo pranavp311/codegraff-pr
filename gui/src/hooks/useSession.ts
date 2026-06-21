@@ -232,6 +232,7 @@ export function useConversationSession(binding?: ChatBinding | null) {
         isConversationLoading:
           currentConversationId != null && currentView == null,
         isOpeningProject: state.isOpeningProject,
+        isUltracodeMode: currentView?.ultracodeEnabled ?? false,
         messages: currentView?.messages ?? EMPTY_MESSAGES,
         requestAgentIds: currentView?.requestAgentIds ?? EMPTY_REQUEST_AGENT_IDS,
         requestTimingsById:

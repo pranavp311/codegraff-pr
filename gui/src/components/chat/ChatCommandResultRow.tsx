@@ -1,6 +1,7 @@
 import {
   CheckCircle2Icon,
   GitBranchIcon,
+  ZapIcon,
   SearchIcon,
   ServerIcon,
 } from "lucide-react";
@@ -13,6 +14,39 @@ import type {
 } from "@/services/desktop/types/contracts";
 
 export function ChatCommandResultRow({ result }: { result: CommandRunResult }) {
+  const isUltracodeResult = result.title === "/ultracode";
+  const ultracodeEnabled = result.body?.toLowerCase().includes("enabled") ?? false;
+
+  if (isUltracodeResult) {
+    return (
+      <article className="w-full min-w-0 max-w-3xl overflow-hidden rounded-xl border border-[color:color-mix(in_oklab,var(--accent)_55%,transparent)] bg-[radial-gradient(circle_at_top_left,color-mix(in_oklab,var(--accent)_14%,transparent),transparent_48%),color-mix(in_oklab,var(--background)_92%,transparent)] px-3.5 py-3 shadow-[0_0_22px_color-mix(in_oklab,var(--accent)_12%,transparent)]">
+        <div className="mb-2 flex items-center gap-2 text-xs font-semibold text-[color:var(--accent)]">
+          <ZapIcon className="size-3.5" />
+          <span>⚡ ultracode mode</span>
+        </div>
+        {ultracodeEnabled ? (
+          <div className="grid gap-1 text-sm text-foreground">
+            <p>
+              Persistent multi-agent orchestration is <strong>ON</strong> for this chat.
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Ordinary prompts now get the workflow/subagent boost. The composer and
+              header show the <span className="font-semibold text-[color:var(--accent)]">⚡ ultra</span> badge.
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Toggle back with <code className="rounded bg-muted px-1 py-0.5">/ultracode off</code>.
+            </p>
+          </div>
+        ) : (
+          <p className="text-sm text-muted-foreground">
+            Ultracode mode is off. Ordinary prompts no longer auto-orchestrate; the
+            codeword still works per prompt.
+          </p>
+        )}
+      </article>
+    );
+  }
+
   return (
     <article className="w-full min-w-0 max-w-3xl overflow-hidden rounded-xl border border-border/60 bg-foreground/[0.02] px-3.5 py-3">
       <div className="mb-2 flex items-center gap-2 text-xs font-medium text-muted-foreground">
@@ -25,10 +59,7 @@ export function ChatCommandResultRow({ result }: { result: CommandRunResult }) {
         </p>
       ) : null}
       {result.body != null && result.payload?.kind !== "agents" ? (
-        <ChatMarkdown
-          text={result.body}
-          className={CHAT_BODY_TONE_CLASS}
-        />
+        <ChatMarkdown text={result.body} className={CHAT_BODY_TONE_CLASS} />
       ) : null}
       {result.payload != null ? <CommandPayloadInline payload={result.payload} /> : null}
     </article>

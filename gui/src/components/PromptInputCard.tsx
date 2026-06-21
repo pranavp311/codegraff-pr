@@ -50,6 +50,7 @@ export function PromptInputCard({
   isRequestActive,
   isSendingPrompt,
   isPlanningMode,
+  isUltracodeMode = false,
   placeholder = "Ask about this workspace…",
   promptSettings,
   promptDraft,
@@ -232,6 +233,8 @@ export function PromptInputCard({
           "relative gap-0 rounded-2xl border border-foreground/5 bg-background/50 p-2 transition-colors transition-shadow ring-0",
           isPlanningMode &&
             "border-[color:var(--accent)] ring-5 ring-[color:color-mix(in_oklab,var(--accent)_14%,transparent)] border-dashed",
+          isUltracodeMode &&
+            "border-[color:color-mix(in_oklab,var(--accent)_65%,transparent)] bg-[radial-gradient(circle_at_top_left,color-mix(in_oklab,var(--accent)_12%,transparent),transparent_42%),color-mix(in_oklab,var(--background)_88%,transparent)] shadow-[0_0_28px_color-mix(in_oklab,var(--accent)_12%,transparent)] ring-5 ring-[color:color-mix(in_oklab,var(--accent)_10%,transparent)]",
         )}
       >
         <CardHeader className="sr-only">
@@ -446,6 +449,15 @@ export function PromptInputCard({
                 <ZapIcon data-icon="inline-start" />
                 <span className="text-xs">Fast</span>
               </Button>
+            ) : null}
+            {isUltracodeMode ? (
+              <span
+                className="inline-flex h-8 items-center gap-1.5 rounded-full px-2 text-xs font-semibold text-[color:var(--accent)]"
+                title="Ultracode mode is ON: ordinary prompts request workflow/subagent orchestration. Toggle with /ultracode off."
+              >
+                <ZapIcon className="size-3.5" />
+                Ultra
+              </span>
             ) : null}
             {isPlanningMode ? (
               <span
