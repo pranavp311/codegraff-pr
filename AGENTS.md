@@ -22,3 +22,15 @@ git pull origin main             # mainline
   protocol changes from `release/0.0.16` **before** touching the app transport.
 
 This branch is meant to follow the others, not diverge them.
+
+## Always change the TUI harness first
+
+When adding or changing harness behavior, do it in the **TUI harness first** — the
+Zig `graff` binary (`src/main.zig`, the interactive terminal) — then surface it in
+the GUI. The terminal harness is the source of truth; the Tauri GUI (`gui/`) is a
+consumer of graff's `--json` event stream, and the iOS app consumes `graff serve`.
+Never build a capability into the GUI (or app) that the TUI harness doesn't have.
+
+Example: the ultracode / `workflow` multi-agent fan-out already renders in the TUI
+(each subagent shows as a launch/done card); the GUI must be updated to consume the
+same per-subagent `--json` events (a live agent tree), not given a divergent path.
